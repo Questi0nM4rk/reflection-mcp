@@ -288,7 +288,7 @@ def _load_lessons() -> list[LessonPattern]:
         try:
             with open(lessons_file, "r") as f:
                 data = json.load(f)
-            _lessons_cache = [_dict_to_lesson(l) for l in data.get("lessons", [])]
+            _lessons_cache = [_dict_to_lesson(lesson) for lesson in data.get("lessons", [])]
         except Exception as e:
             logger.error(f"Failed to load lessons: {e}")
             _lessons_cache = []
@@ -304,7 +304,7 @@ def _save_lessons():
     lessons_file = _get_lessons_file()
     try:
         data = {
-            "lessons": [_lesson_to_dict(l) for l in _lessons_cache],
+            "lessons": [_lesson_to_dict(lesson) for lesson in _lessons_cache],
             "updated_at": datetime.now().isoformat(),
         }
         with open(lessons_file, "w") as f:
@@ -343,7 +343,7 @@ def _update_lesson_patterns():
         lesson_text = group[0].reflection.general_lesson if group[0].reflection else ""
 
         # Find existing lesson or create new
-        existing = next((l for l in lessons if l.pattern == key), None)
+        existing = next((lesson for lesson in lessons if lesson.pattern == key), None)
 
         # Calculate success rate
         successes = sum(1 for ep in group if ep.led_to_success)
@@ -762,15 +762,15 @@ def get_common_lessons() -> dict[str, Any]:
 
     # Also include aggregated lesson patterns with effectiveness
     _update_lesson_patterns()
-    lessons = _load_lessons()
+    lesson_patterns = _load_lessons()
     effective_lessons = [
         {
-            "lesson": l.lesson,
-            "feedback_type": l.feedback_type.value,
-            "occurrences": l.occurrences,
-            "success_rate": round(l.success_rate, 3),
+            "lesson": lesson.lesson,
+            "feedback_type": lesson.feedback_type.value,
+            "occurrences": lesson.occurrences,
+            "success_rate": round(lesson.success_rate, 3),
         }
-        for l in sorted(lessons, key=lambda x: x.success_rate * x.occurrences, reverse=True)[:10]
+        for lesson in sorted(lesson_patterns, key=lambda x: x.success_rate * x.occurrences, reverse=True)[:10]
     ]
 
     return {
@@ -965,15 +965,15 @@ def export_lessons(
     if feedback_type:
         try:
             fb_type = FeedbackType(feedback_type)
-            filtered = [l for l in filtered if l.feedback_type == fb_type]
+            filtered = [lesson for lesson in filtered if lesson.feedback_type == fb_type]
         except ValueError:
             pass
 
-    filtered = [l for l in filtered if l.occurrences >= min_occurrences]
-    filtered = [l for l in filtered if l.success_rate >= min_success_rate]
+    filtered = [lesson for lesson in filtered if lesson.occurrences >= min_occurrences]
+    filtered = [lesson for lesson in filtered if lesson.success_rate >= min_success_rate]
 
     # Sort by effectiveness
-    filtered.sort(key=lambda l: l.success_rate * l.occurrences, reverse=True)
+    filtered.sort(key=lambda lesson: lesson.success_rate * lesson.occurrences, reverse=True)
 
     # Format for learner skill
     exportable = []
