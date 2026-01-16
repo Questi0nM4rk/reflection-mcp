@@ -1,0 +1,19 @@
+[project]
+name = "reflection-mcp"
+version = "0.2.0"
+description = "Self-reflection MCP server with persistent episodic memory and lesson effectiveness tracking"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[project.scripts]
+reflection-mcp = "reflection_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reflection_mcp"]
