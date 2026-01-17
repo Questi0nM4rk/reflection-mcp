@@ -5,10 +5,12 @@ Implements Reflexion pattern with persistent episodic memory.
 Based on NeurIPS 2023 research showing 67% → 88% improvement on HumanEval (+21%).
 
 Features:
-- Persistent storage (JSON files in ~/.codeagent/data/reflection-episodes/)
+- Persistent libSQL storage with optional vector search
 - Lesson effectiveness tracking (did applying a lesson lead to success?)
 - Cross-session learning aggregation
 - Export capability for learner skill integration
+
+Database: ~/.codeagent/codeagent.db
 
 Tools:
 - reflect_on_failure: Analyze why output failed and generate insights
@@ -26,26 +28,28 @@ Tools:
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+import struct
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import libsql_experimental as libsql
 from mcp.server.fastmcp import FastMCP
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Persistent storage directory
-DATA_DIR = (
-    Path(os.environ.get("CODEAGENT_HOME", Path.home() / ".codeagent"))
-    / "data"
-    / "reflection-episodes"
-)
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# Database configuration
+CODEAGENT_DIR = Path(os.environ.get("CODEAGENT_HOME", Path.home() / ".codeagent"))
+CODEAGENT_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = CODEAGENT_DIR / "codeagent.db"
+
+# Embedding configuration
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+EMBEDDING_DIM = 384
 
 # Initialize FastMCP server
 mcp = FastMCP(
@@ -53,6 +57,30 @@ mcp = FastMCP(
     instructions="Self-reflection and episodic memory for learning from failures. "
     "Use this when code fails tests or reviews to improve on subsequent attempts.",
 )
+
+# Lazy-loaded singleton
+_embedding_model = None
+
+
+def _get_embedding_model():
+    """Get or load the sentence transformer model."""
+    global _embedding_model
+    if _embedding_model is not None:
+        return _embedding_model
+
+    try:
+        from sentence_transformers import SentenceTransformer
+
+        _embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        logger.info(f"Loaded embedding model: {EMBEDDING_MODEL}")
+    except ImportError:
+        logger.debug("sentence-transformers not installed, using keyword similarity")
+        _embedding_model = None
+    except Exception as e:
+        logger.warning(f"Failed to load embedding model: {e}")
+        _embedding_model = None
+
+    return _embedding_model
 
 
 class FeedbackType(str, Enum):
@@ -76,316 +104,136 @@ class OutcomeType(str, Enum):
     FAILURE = "failure"
 
 
-@dataclass
-class Reflection:
-    """A reflection on a failure."""
-
-    id: str
-    what_went_wrong: str
-    root_cause: str
-    what_to_try_next: str
-    general_lesson: str
-    confidence: float  # 0-1 confidence in the reflection
-    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+def _get_db() -> libsql.Connection:
+    """Get database connection, creating schema if needed."""
+    conn = libsql.connect(str(DB_PATH))
+    _init_schema(conn)
+    return conn
 
 
-@dataclass
-class Episode:
-    """An episodic memory of a task attempt."""
+def _init_schema(conn: libsql.Connection) -> None:
+    """Initialize database schema."""
+    conn.executescript(f"""
+        CREATE TABLE IF NOT EXISTS episodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_id TEXT UNIQUE NOT NULL,
+            task TEXT NOT NULL,
+            approach TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            feedback TEXT NOT NULL,
+            feedback_type TEXT NOT NULL,
+            reflection TEXT,
+            code_context TEXT,
+            file_path TEXT,
+            attempt_number INTEGER DEFAULT 1,
+            duration_seconds REAL,
+            tags TEXT,
+            lesson_applied_from TEXT,
+            led_to_success INTEGER,
+            effectiveness_score REAL DEFAULT 0.0,
+            embedding F32_BLOB({EMBEDDING_DIM}),
+            created_at TEXT DEFAULT (datetime('now'))
+        );
 
-    id: str
-    task: str
-    approach: str
-    outcome: OutcomeType
-    feedback: str
-    feedback_type: FeedbackType
-    reflection: Reflection | None
-    code_context: str  # Relevant code snippet
-    file_path: str | None
-    attempt_number: int
-    duration_seconds: float | None
-    tags: list[str] = field(default_factory=list)
-    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
-    # New fields for effectiveness tracking
-    lesson_applied_from: str | None = None  # Episode ID if lesson was applied
-    led_to_success: bool | None = None  # Did this episode lead to success?
-    effectiveness_score: float = 0.0  # How effective was the lesson (0-1)
+        CREATE TABLE IF NOT EXISTS lesson_effectiveness (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_id TEXT NOT NULL,
+            led_to_success INTEGER NOT NULL,
+            effectiveness_score REAL DEFAULT 0.5,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (episode_id) REFERENCES episodes(episode_id)
+        );
 
+        CREATE TABLE IF NOT EXISTS episode_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_id TEXT NOT NULL,
+            lesson_episode_id TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (episode_id) REFERENCES episodes(episode_id),
+            FOREIGN KEY (lesson_episode_id) REFERENCES episodes(episode_id)
+        );
 
-@dataclass
-class LessonPattern:
-    """An aggregated lesson pattern from multiple episodes."""
+        CREATE TABLE IF NOT EXISTS task_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_key TEXT UNIQUE NOT NULL,
+            attempt_count INTEGER DEFAULT 0
+        );
 
-    id: str
-    feedback_type: FeedbackType
-    pattern: str  # Common error pattern
-    lesson: str  # What to do
-    occurrences: int
-    success_rate: float  # How often applying this lesson leads to success
-    example_tasks: list[str]
-    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
-    updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
+        CREATE INDEX IF NOT EXISTS idx_episodes_feedback_type ON episodes(feedback_type);
+        CREATE INDEX IF NOT EXISTS idx_episodes_outcome ON episodes(outcome);
+        CREATE INDEX IF NOT EXISTS idx_episodes_created_at ON episodes(created_at);
+    """)
 
+    # Create vector index separately
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS libsql_vector_idx_episodes ON episodes(embedding)"
+        )
+    except Exception as e:
+        logger.debug(f"Vector index may already exist: {e}")
 
-# In-memory cache (loaded from disk on demand)
-_episodes_cache: list[Episode] = []
-_task_attempts: dict[str, int] = {}
-_lessons_cache: list[LessonPattern] = []
-_episodes_loaded: bool = False
-_lessons_loaded: bool = False
-
-
-def _get_episodes_file() -> Path:
-    """Get path to episodes JSON file."""
-    return DATA_DIR / "episodes.json"
-
-
-def _get_lessons_file() -> Path:
-    """Get path to lessons JSON file."""
-    return DATA_DIR / "lessons.json"
-
-
-def _episode_to_dict(episode: Episode) -> dict:
-    """Convert episode to serializable dict."""
-    return {
-        "id": episode.id,
-        "task": episode.task,
-        "approach": episode.approach,
-        "outcome": episode.outcome.value,
-        "feedback": episode.feedback,
-        "feedback_type": episode.feedback_type.value,
-        "reflection": {
-            "id": episode.reflection.id,
-            "what_went_wrong": episode.reflection.what_went_wrong,
-            "root_cause": episode.reflection.root_cause,
-            "what_to_try_next": episode.reflection.what_to_try_next,
-            "general_lesson": episode.reflection.general_lesson,
-            "confidence": episode.reflection.confidence,
-            "created_at": episode.reflection.created_at,
-        }
-        if episode.reflection
-        else None,
-        "code_context": episode.code_context,
-        "file_path": episode.file_path,
-        "attempt_number": episode.attempt_number,
-        "duration_seconds": episode.duration_seconds,
-        "tags": episode.tags,
-        "created_at": episode.created_at,
-        "lesson_applied_from": episode.lesson_applied_from,
-        "led_to_success": episode.led_to_success,
-        "effectiveness_score": episode.effectiveness_score,
-    }
+    conn.commit()
 
 
-def _dict_to_episode(data: dict) -> Episode:
-    """Convert dict to Episode."""
-    reflection = None
-    if data.get("reflection"):
-        r = data["reflection"]
-        reflection = Reflection(
-            id=r.get("id", ""),
-            what_went_wrong=r.get("what_went_wrong", ""),
-            root_cause=r.get("root_cause", ""),
-            what_to_try_next=r.get("what_to_try_next", ""),
-            general_lesson=r.get("general_lesson", ""),
-            confidence=r.get("confidence", 0.5),
-            created_at=r.get("created_at", ""),
+def _embed(text: str) -> bytes | None:
+    """Generate embedding for text, returns F32_BLOB bytes."""
+    model = _get_embedding_model()
+    if model is None:
+        return None
+
+    try:
+        embedding = model.encode(text, convert_to_numpy=True)
+        return struct.pack(f"<{EMBEDDING_DIM}f", *embedding.tolist())
+    except Exception as e:
+        logger.error(f"Embedding generation failed: {e}")
+        return None
+
+
+def _json_loads(val: str | None) -> dict | list | None:
+    """Parse JSON or return None."""
+    if val is None:
+        return None
+    try:
+        return json.loads(val)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _json_dumps(val: dict | list | None) -> str | None:
+    """Serialize to JSON or return None."""
+    if val is None:
+        return None
+    return json.dumps(val)
+
+
+def _get_attempt_number(conn: libsql.Connection, task: str) -> int:
+    """Get and increment attempt number for a task."""
+    task_key = task[:100]
+
+    cursor = conn.execute(
+        "SELECT attempt_count FROM task_attempts WHERE task_key = ?",
+        (task_key,),
+    )
+    row = cursor.fetchone()
+
+    if row:
+        count = row[0] + 1
+        conn.execute(
+            "UPDATE task_attempts SET attempt_count = ? WHERE task_key = ?",
+            (count, task_key),
+        )
+    else:
+        count = 1
+        conn.execute(
+            "INSERT INTO task_attempts (task_key, attempt_count) VALUES (?, ?)",
+            (task_key, count),
         )
 
-    return Episode(
-        id=data["id"],
-        task=data["task"],
-        approach=data["approach"],
-        outcome=OutcomeType(data.get("outcome", "failure")),
-        feedback=data["feedback"],
-        feedback_type=FeedbackType(data.get("feedback_type", "test_failure")),
-        reflection=reflection,
-        code_context=data.get("code_context", ""),
-        file_path=data.get("file_path"),
-        attempt_number=data.get("attempt_number", 1),
-        duration_seconds=data.get("duration_seconds"),
-        tags=data.get("tags", []),
-        created_at=data.get("created_at", ""),
-        lesson_applied_from=data.get("lesson_applied_from"),
-        led_to_success=data.get("led_to_success"),
-        effectiveness_score=data.get("effectiveness_score", 0.0),
-    )
-
-
-def _load_episodes() -> list[Episode]:
-    """Load episodes from disk."""
-    global _episodes_cache, _episodes_loaded, _task_attempts
-
-    if _episodes_loaded:
-        return _episodes_cache
-
-    episodes_file = _get_episodes_file()
-    if episodes_file.exists():
-        try:
-            with open(episodes_file, "r") as f:
-                data = json.load(f)
-            _episodes_cache = [_dict_to_episode(e) for e in data.get("episodes", [])]
-            _task_attempts = data.get("task_attempts", {})
-            logger.info(f"Loaded {len(_episodes_cache)} episodes from disk")
-        except Exception as e:
-            logger.error(f"Failed to load episodes: {e}")
-            _episodes_cache = []
-    else:
-        _episodes_cache = []
-
-    _episodes_loaded = True
-    return _episodes_cache
-
-
-def _save_episodes():
-    """Save episodes to disk."""
-    episodes_file = _get_episodes_file()
-    try:
-        data = {
-            "episodes": [_episode_to_dict(e) for e in _episodes_cache],
-            "task_attempts": _task_attempts,
-            "updated_at": datetime.now().isoformat(),
-        }
-        with open(episodes_file, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        logger.error(f"Failed to save episodes: {e}")
-
-
-def _lesson_to_dict(lesson: LessonPattern) -> dict:
-    """Convert lesson to serializable dict."""
-    return {
-        "id": lesson.id,
-        "feedback_type": lesson.feedback_type.value,
-        "pattern": lesson.pattern,
-        "lesson": lesson.lesson,
-        "occurrences": lesson.occurrences,
-        "success_rate": lesson.success_rate,
-        "example_tasks": lesson.example_tasks,
-        "created_at": lesson.created_at,
-        "updated_at": lesson.updated_at,
-    }
-
-
-def _dict_to_lesson(data: dict) -> LessonPattern:
-    """Convert dict to LessonPattern."""
-    return LessonPattern(
-        id=data["id"],
-        feedback_type=FeedbackType(data.get("feedback_type", "test_failure")),
-        pattern=data["pattern"],
-        lesson=data["lesson"],
-        occurrences=data.get("occurrences", 1),
-        success_rate=data.get("success_rate", 0.0),
-        example_tasks=data.get("example_tasks", []),
-        created_at=data.get("created_at", ""),
-        updated_at=data.get("updated_at", ""),
-    )
-
-
-def _load_lessons() -> list[LessonPattern]:
-    """Load aggregated lessons from disk."""
-    global _lessons_cache, _lessons_loaded
-
-    if _lessons_loaded:
-        return _lessons_cache
-
-    lessons_file = _get_lessons_file()
-    if lessons_file.exists():
-        try:
-            with open(lessons_file, "r") as f:
-                data = json.load(f)
-            _lessons_cache = [
-                _dict_to_lesson(lesson) for lesson in data.get("lessons", [])
-            ]
-        except Exception as e:
-            logger.error(f"Failed to load lessons: {e}")
-            _lessons_cache = []
-    else:
-        _lessons_cache = []
-
-    _lessons_loaded = True
-    return _lessons_cache
-
-
-def _save_lessons():
-    """Save lessons to disk."""
-    lessons_file = _get_lessons_file()
-    try:
-        data = {
-            "lessons": [_lesson_to_dict(lesson) for lesson in _lessons_cache],
-            "updated_at": datetime.now().isoformat(),
-        }
-        with open(lessons_file, "w") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        logger.error(f"Failed to save lessons: {e}")
-
-
-def _get_attempt_number(task: str) -> int:
-    """Get and increment attempt number for a task."""
-    _load_episodes()  # Ensure loaded
-    key = task[:100]  # Normalize task key
-    count = _task_attempts.get(key, 0) + 1
-    _task_attempts[key] = count
     return count
-
-
-def _update_lesson_patterns():
-    """Aggregate episodes into lesson patterns."""
-    episodes = _load_episodes()
-    lessons = _load_lessons()
-
-    # Group by feedback type and lesson
-    pattern_groups: dict[str, list[Episode]] = {}
-
-    for ep in episodes:
-        if ep.reflection and ep.reflection.general_lesson:
-            key = f"{ep.feedback_type.value}:{ep.reflection.general_lesson[:50]}"
-            if key not in pattern_groups:
-                pattern_groups[key] = []
-            pattern_groups[key].append(ep)
-
-    # Update or create lesson patterns
-    for key, group in pattern_groups.items():
-        fb_type, _ = key.split(":", 1)
-        lesson_text = group[0].reflection.general_lesson if group[0].reflection else ""
-
-        # Find existing lesson or create new
-        existing = next((lesson for lesson in lessons if lesson.pattern == key), None)
-
-        # Calculate success rate
-        successes = sum(1 for ep in group if ep.led_to_success)
-        total_tracked = sum(1 for ep in group if ep.led_to_success is not None)
-        success_rate = successes / total_tracked if total_tracked > 0 else 0.0
-
-        if existing:
-            existing.occurrences = len(group)
-            existing.success_rate = success_rate
-            existing.example_tasks = list(set(ep.task[:80] for ep in group[:5]))
-            existing.updated_at = datetime.now().isoformat()
-        else:
-            new_lesson = LessonPattern(
-                id=str(uuid4())[:8],
-                feedback_type=FeedbackType(fb_type),
-                pattern=key,
-                lesson=lesson_text,
-                occurrences=len(group),
-                success_rate=success_rate,
-                example_tasks=list(set(ep.task[:80] for ep in group[:5])),
-            )
-            lessons.append(new_lesson)
-
-    global _lessons_cache
-    _lessons_cache = lessons
-    _save_lessons()
 
 
 def _keyword_similarity(text1: str, text2: str) -> float:
     """Simple keyword-based similarity score."""
-    words1 = set(text1.lower().split())
-    words2 = set(text2.lower().split())
-
-    # Remove common words
     stopwords = {
         "the",
         "a",
@@ -449,8 +297,8 @@ def _keyword_similarity(text1: str, text2: str) -> float:
         "its",
     }
 
-    words1 = words1 - stopwords
-    words2 = words2 - stopwords
+    words1 = set(text1.lower().split()) - stopwords
+    words2 = set(text2.lower().split()) - stopwords
 
     if not words1 or not words2:
         return 0.0
@@ -459,6 +307,11 @@ def _keyword_similarity(text1: str, text2: str) -> float:
     union = words1 | words2
 
     return len(intersection) / len(union) if union else 0.0
+
+
+# ============================================
+# MCP Tools
+# ============================================
 
 
 @mcp.tool()
@@ -482,15 +335,10 @@ def reflect_on_failure(
     """
     reflection_id = str(uuid4())[:8]
 
-    # Parse feedback type
     try:
         fb_type = FeedbackType(feedback_type)
     except ValueError:
         fb_type = FeedbackType.TEST_FAILURE
-
-    # Generate reflection structure
-    # In a production system, this would use an LLM to generate better reflections
-    # Here we provide structured prompts for the calling agent to fill in
 
     return {
         "reflection_id": reflection_id,
@@ -506,8 +354,8 @@ def reflect_on_failure(
             "confidence": "[0.0-1.0 - how confident are you in this analysis]",
         },
         "guidance": {
-            "test_failure": "Focus on what assertion failed and why the code doesn't satisfy the test condition.",
-            "lint_error": "Identify the specific rule violation and the correct pattern to use.",
+            "test_failure": "Focus on what assertion failed and why the code doesn't satisfy the test.",
+            "lint_error": "Identify the specific rule violation and the correct pattern.",
             "build_error": "Focus on type mismatches, missing imports, or syntax issues.",
             "review_comment": "Consider the reviewer's perspective and what they're trying to improve.",
             "runtime_error": "Focus on the error type and what state led to the failure.",
@@ -551,64 +399,73 @@ def store_episode(
     Returns:
         Stored episode ID and confirmation
     """
-    episode_id = str(uuid4())[:8]
-
-    # Parse outcome
     try:
-        outcome_type = OutcomeType(outcome)
-    except ValueError:
-        outcome_type = OutcomeType.FAILURE
+        conn = _get_db()
+        episode_id = str(uuid4())[:8]
 
-    # Parse feedback type
-    try:
-        fb_type = FeedbackType(feedback_type)
-    except ValueError:
-        fb_type = FeedbackType.TEST_FAILURE
+        try:
+            outcome_type = OutcomeType(outcome)
+        except ValueError:
+            outcome_type = OutcomeType.FAILURE
 
-    # Create reflection object
-    refl = Reflection(
-        id=str(uuid4())[:8],
-        what_went_wrong=reflection.get("what_went_wrong", ""),
-        root_cause=reflection.get("root_cause", ""),
-        what_to_try_next=reflection.get("what_to_try_next", ""),
-        general_lesson=reflection.get("general_lesson", ""),
-        confidence=float(reflection.get("confidence", 0.5)),
-    )
+        try:
+            fb_type = FeedbackType(feedback_type)
+        except ValueError:
+            fb_type = FeedbackType.TEST_FAILURE
 
-    # Create episode
-    episode = Episode(
-        id=episode_id,
-        task=task,
-        approach=approach,
-        outcome=outcome_type,
-        feedback=feedback[:2000],  # Truncate long feedback
-        feedback_type=fb_type,
-        reflection=refl,
-        code_context=code_context[:3000],  # Truncate long code
-        file_path=file_path,
-        attempt_number=_get_attempt_number(task),
-        duration_seconds=duration_seconds,
-        tags=tags or [],
-    )
+        attempt_number = _get_attempt_number(conn, task)
 
-    episodes = _load_episodes()
-    episodes.append(episode)
-    _save_episodes()
+        # Generate embedding from task + approach + feedback
+        embed_text = f"{task} {approach} {feedback}"
+        embedding = _embed(embed_text)
 
-    # Update lesson patterns periodically
-    if len(episodes) % 5 == 0:  # Every 5 episodes
-        _update_lesson_patterns()
+        now = datetime.now().isoformat()
 
-    return {
-        "episode_id": episode_id,
-        "task": task[:100],
-        "attempt_number": episode.attempt_number,
-        "outcome": outcome_type.value,
-        "stored": True,
-        "total_episodes": len(episodes),
-        "lesson": refl.general_lesson,
-        "storage": str(_get_episodes_file()),
-    }
+        conn.execute(
+            """
+            INSERT INTO episodes (
+                episode_id, task, approach, outcome, feedback, feedback_type,
+                reflection, code_context, file_path, attempt_number,
+                duration_seconds, tags, embedding, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                episode_id,
+                task,
+                approach,
+                outcome_type.value,
+                feedback[:2000],
+                fb_type.value,
+                _json_dumps(reflection),
+                code_context[:3000] if code_context else None,
+                file_path,
+                attempt_number,
+                duration_seconds,
+                _json_dumps(tags),
+                embedding,
+                now,
+            ),
+        )
+        conn.commit()
+
+        # Count total episodes
+        cursor = conn.execute("SELECT COUNT(*) FROM episodes")
+        total = cursor.fetchone()[0]
+
+        return {
+            "episode_id": episode_id,
+            "task": task[:100],
+            "attempt_number": attempt_number,
+            "outcome": outcome_type.value,
+            "stored": True,
+            "total_episodes": total,
+            "lesson": reflection.get("general_lesson", ""),
+            "storage": str(DB_PATH),
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to store episode: {e}")
+        return {"stored": False, "error": str(e)}
 
 
 @mcp.tool()
@@ -632,79 +489,178 @@ def retrieve_episodes(
     Returns:
         Relevant past episodes with their reflections
     """
-    top_k = min(max(top_k, 1), 20)
+    try:
+        conn = _get_db()
+        top_k = min(max(top_k, 1), 20)
 
-    # Filter episodes
-    episodes = _load_episodes()
-    candidates = episodes.copy()
+        results = []
 
-    if feedback_type:
-        try:
-            fb_type = FeedbackType(feedback_type)
-            candidates = [e for e in candidates if e.feedback_type == fb_type]
-        except ValueError:
-            pass
+        # Try vector search first
+        embed_text = f"{task} {error_pattern}"
+        embedding = _embed(embed_text)
 
-    if not include_successes:
-        candidates = [e for e in candidates if e.outcome != OutcomeType.SUCCESS]
+        if embedding is not None:
+            try:
+                sql = """
+                    SELECT episode_id, task, approach, outcome, feedback_type,
+                           attempt_number, reflection, created_at,
+                           vector_distance_cos(embedding, ?) as distance
+                    FROM episodes
+                    WHERE embedding IS NOT NULL
+                """
+                params: list[Any] = [embedding]
 
-    # Score by similarity
-    scored = []
-    for episode in candidates:
-        task_sim = _keyword_similarity(task, episode.task)
-        error_sim = (
-            _keyword_similarity(error_pattern, episode.feedback) if error_pattern else 0
-        )
+                if feedback_type:
+                    sql += " AND feedback_type = ?"
+                    params.append(feedback_type)
 
-        # Combine scores (task similarity more important)
-        score = task_sim * 0.7 + error_sim * 0.3
+                if not include_successes:
+                    sql += " AND outcome != 'success'"
 
-        # Boost recent episodes slightly
-        scored.append((score, episode))
+                sql += " ORDER BY distance ASC LIMIT ?"
+                params.append(top_k)
 
-    # Sort by score descending
-    scored.sort(key=lambda x: x[0], reverse=True)
+                cursor = conn.execute(sql, params)
 
-    # Take top-k
-    results = []
-    for score, episode in scored[:top_k]:
-        results.append(
-            {
-                "episode_id": episode.id,
-                "task": episode.task[:200],
-                "approach": episode.approach[:200],
-                "outcome": episode.outcome.value,
-                "feedback_type": episode.feedback_type.value,
-                "attempt_number": episode.attempt_number,
-                "similarity_score": round(score, 3),
-                "reflection": {
-                    "what_went_wrong": episode.reflection.what_went_wrong
-                    if episode.reflection
-                    else "",
-                    "root_cause": episode.reflection.root_cause
-                    if episode.reflection
-                    else "",
-                    "what_to_try_next": episode.reflection.what_to_try_next
-                    if episode.reflection
-                    else "",
-                    "general_lesson": episode.reflection.general_lesson
-                    if episode.reflection
-                    else "",
-                }
-                if episode.reflection
-                else None,
-                "created_at": episode.created_at,
-            }
-        )
+                for row in cursor.fetchall():
+                    (
+                        ep_id,
+                        ep_task,
+                        ep_approach,
+                        ep_outcome,
+                        ep_fb_type,
+                        ep_attempt,
+                        ep_refl_json,
+                        ep_created,
+                        distance,
+                    ) = row
 
-    return {
-        "query_task": task[:100],
-        "query_error": error_pattern[:100] if error_pattern else None,
-        "episodes": results,
-        "count": len(results),
-        "instruction": "Apply lessons from these past episodes to your current approach. "
-        "Focus on the general_lesson and what_to_try_next fields.",
-    }
+                    refl = _json_loads(ep_refl_json)
+                    score = 1.0 / (1.0 + distance) if distance else 1.0
+
+                    results.append(
+                        {
+                            "episode_id": ep_id,
+                            "task": ep_task[:200],
+                            "approach": ep_approach[:200],
+                            "outcome": ep_outcome,
+                            "feedback_type": ep_fb_type,
+                            "attempt_number": ep_attempt,
+                            "similarity_score": round(score, 3),
+                            "reflection": {
+                                "what_went_wrong": refl.get("what_went_wrong", "")
+                                if refl
+                                else "",
+                                "root_cause": refl.get("root_cause", "")
+                                if refl
+                                else "",
+                                "what_to_try_next": refl.get("what_to_try_next", "")
+                                if refl
+                                else "",
+                                "general_lesson": refl.get("general_lesson", "")
+                                if refl
+                                else "",
+                            }
+                            if refl
+                            else None,
+                            "created_at": ep_created,
+                        }
+                    )
+
+            except Exception as e:
+                logger.debug(f"Vector search failed: {e}")
+
+        # Fallback: keyword similarity
+        if not results:
+            sql = "SELECT episode_id, task, approach, outcome, feedback, feedback_type, attempt_number, reflection, created_at FROM episodes"
+            params = []
+
+            conditions = []
+            if feedback_type:
+                conditions.append("feedback_type = ?")
+                params.append(feedback_type)
+
+            if not include_successes:
+                conditions.append("outcome != 'success'")
+
+            if conditions:
+                sql += " WHERE " + " AND ".join(conditions)
+
+            sql += " LIMIT 100"
+
+            cursor = conn.execute(sql, params)
+
+            scored = []
+            for row in cursor.fetchall():
+                (
+                    ep_id,
+                    ep_task,
+                    ep_approach,
+                    ep_outcome,
+                    ep_feedback,
+                    ep_fb_type,
+                    ep_attempt,
+                    ep_refl_json,
+                    ep_created,
+                ) = row
+
+                task_sim = _keyword_similarity(task, ep_task)
+                error_sim = (
+                    _keyword_similarity(error_pattern, ep_feedback)
+                    if error_pattern
+                    else 0
+                )
+                score = task_sim * 0.7 + error_sim * 0.3
+
+                refl = _json_loads(ep_refl_json)
+
+                scored.append(
+                    (
+                        score,
+                        {
+                            "episode_id": ep_id,
+                            "task": ep_task[:200],
+                            "approach": ep_approach[:200],
+                            "outcome": ep_outcome,
+                            "feedback_type": ep_fb_type,
+                            "attempt_number": ep_attempt,
+                            "similarity_score": round(score, 3),
+                            "reflection": {
+                                "what_went_wrong": refl.get("what_went_wrong", "")
+                                if refl
+                                else "",
+                                "root_cause": refl.get("root_cause", "")
+                                if refl
+                                else "",
+                                "what_to_try_next": refl.get("what_to_try_next", "")
+                                if refl
+                                else "",
+                                "general_lesson": refl.get("general_lesson", "")
+                                if refl
+                                else "",
+                            }
+                            if refl
+                            else None,
+                            "created_at": ep_created,
+                        },
+                    )
+                )
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            results = [ep for _, ep in scored[:top_k]]
+
+        return {
+            "query_task": task[:100],
+            "query_error": error_pattern[:100] if error_pattern else None,
+            "episodes": results,
+            "count": len(results),
+            "instruction": "Apply lessons from these past episodes to your current approach. "
+            "Focus on the general_lesson and what_to_try_next fields.",
+        }
+
+    except Exception as e:
+        logger.error(f"Retrieve failed: {e}")
+        return {"query_task": task[:100], "episodes": [], "count": 0, "error": str(e)}
 
 
 @mcp.tool()
@@ -724,7 +680,6 @@ def generate_improved_attempt(
     Returns:
         Guidance for generating an improved solution
     """
-    # Extract lessons from episodes
     past_lessons = []
     if similar_episodes:
         for ep in similar_episodes:
@@ -743,7 +698,7 @@ def generate_improved_attempt(
             "root_cause": reflection.get("root_cause", "Unknown"),
             "what_to_try_next": reflection.get("what_to_try_next", ""),
         },
-        "past_lessons": past_lessons[:5],  # Top 5 relevant lessons
+        "past_lessons": past_lessons[:5],
         "improvement_strategy": {
             "1_address_root_cause": f"Fix: {reflection.get('root_cause', 'the identified issue')}",
             "2_apply_lesson": reflection.get(
@@ -775,49 +730,81 @@ def get_reflection_history(
     Returns:
         History of reflections with outcomes
     """
-    limit = min(max(limit, 1), 50)
+    try:
+        conn = _get_db()
+        limit = min(max(limit, 1), 50)
 
-    # Filter episodes
-    episodes = _load_episodes()
-    if task:
-        filtered = [e for e in episodes if task.lower() in e.task.lower()]
-    else:
-        filtered = episodes.copy()
+        if task:
+            cursor = conn.execute(
+                """
+                SELECT episode_id, task, outcome, feedback_type, attempt_number,
+                       reflection, created_at
+                FROM episodes
+                WHERE task LIKE ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (f"%{task}%", limit),
+            )
+        else:
+            cursor = conn.execute(
+                """
+                SELECT episode_id, task, outcome, feedback_type, attempt_number,
+                       reflection, created_at
+                FROM episodes
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
 
-    # Sort by created_at descending (most recent first)
-    filtered.sort(key=lambda e: e.created_at, reverse=True)
+        history = []
+        for row in cursor.fetchall():
+            (
+                ep_id,
+                ep_task,
+                ep_outcome,
+                ep_fb_type,
+                ep_attempt,
+                ep_refl_json,
+                ep_created,
+            ) = row
+            refl = _json_loads(ep_refl_json)
 
-    # Format results
-    history = []
-    for episode in filtered[:limit]:
-        history.append(
-            {
-                "episode_id": episode.id,
-                "task": episode.task[:100],
-                "outcome": episode.outcome.value,
-                "feedback_type": episode.feedback_type.value,
-                "attempt_number": episode.attempt_number,
-                "lesson": episode.reflection.general_lesson
-                if episode.reflection
-                else None,
-                "created_at": episode.created_at,
-            }
+            history.append(
+                {
+                    "episode_id": ep_id,
+                    "task": ep_task[:100],
+                    "outcome": ep_outcome,
+                    "feedback_type": ep_fb_type,
+                    "attempt_number": ep_attempt,
+                    "lesson": refl.get("general_lesson") if refl else None,
+                    "created_at": ep_created,
+                }
+            )
+
+        # Calculate stats
+        cursor = conn.execute(
+            """
+            SELECT outcome, COUNT(*) FROM episodes
+            WHERE task LIKE ?
+            GROUP BY outcome
+            """,
+            (f"%{task}%" if task else "%",),
         )
+        outcome_counts = dict(cursor.fetchall())
 
-    # Calculate stats
-    outcomes = [e.outcome for e in filtered]
-    stats = {
-        "total": len(filtered),
-        "successes": sum(1 for o in outcomes if o == OutcomeType.SUCCESS),
-        "partial": sum(1 for o in outcomes if o == OutcomeType.PARTIAL),
-        "failures": sum(1 for o in outcomes if o == OutcomeType.FAILURE),
-    }
+        stats = {
+            "total": sum(outcome_counts.values()),
+            "successes": outcome_counts.get("success", 0),
+            "partial": outcome_counts.get("partial", 0),
+            "failures": outcome_counts.get("failure", 0),
+        }
 
-    return {
-        "history": history,
-        "stats": stats,
-        "filter": task,
-    }
+        return {"history": history, "stats": stats, "filter": task}
+
+    except Exception as e:
+        return {"history": [], "stats": {}, "error": str(e)}
 
 
 @mcp.tool()
@@ -828,46 +815,71 @@ def get_common_lessons() -> dict[str, Any]:
     Returns:
         Common lessons learned, organized by feedback type
     """
-    episodes = _load_episodes()
-    lessons_by_type: dict[str, list[str]] = {}
+    try:
+        conn = _get_db()
 
-    for episode in episodes:
-        if episode.reflection and episode.reflection.general_lesson:
-            fb_type = episode.feedback_type.value
-            if fb_type not in lessons_by_type:
-                lessons_by_type[fb_type] = []
-            lessons_by_type[fb_type].append(episode.reflection.general_lesson)
+        cursor = conn.execute(
+            "SELECT feedback_type, reflection FROM episodes WHERE reflection IS NOT NULL"
+        )
 
-    # Deduplicate and format
-    formatted = {}
-    for fb_type, lessons in lessons_by_type.items():
-        # Simple deduplication by keeping unique lessons
-        unique = list(set(lessons))
-        formatted[fb_type] = unique[:10]  # Top 10 per type
+        lessons_by_type: dict[str, list[str]] = {}
+        for row in cursor.fetchall():
+            fb_type, refl_json = row
+            refl = _json_loads(refl_json)
+            if refl and refl.get("general_lesson"):
+                if fb_type not in lessons_by_type:
+                    lessons_by_type[fb_type] = []
+                lessons_by_type[fb_type].append(refl["general_lesson"])
 
-    # Also include aggregated lesson patterns with effectiveness
-    _update_lesson_patterns()
-    lesson_patterns = _load_lessons()
-    effective_lessons = [
-        {
-            "lesson": lesson.lesson,
-            "feedback_type": lesson.feedback_type.value,
-            "occurrences": lesson.occurrences,
-            "success_rate": round(lesson.success_rate, 3),
+        # Deduplicate
+        formatted = {}
+        for fb_type, lessons in lessons_by_type.items():
+            unique = list(set(lessons))
+            formatted[fb_type] = unique[:10]
+
+        # Get lesson effectiveness
+        cursor = conn.execute(
+            """
+            SELECT reflection, feedback_type,
+                   COUNT(*) as occurrences,
+                   SUM(CASE WHEN led_to_success = 1 THEN 1 ELSE 0 END) as successes
+            FROM episodes
+            WHERE reflection IS NOT NULL AND led_to_success IS NOT NULL
+            GROUP BY reflection
+            ORDER BY occurrences DESC
+            LIMIT 10
+            """
+        )
+
+        effective_lessons = []
+        for row in cursor.fetchall():
+            refl_json, fb_type, occurrences, successes = row
+            refl = _json_loads(refl_json)
+            if refl and refl.get("general_lesson"):
+                success_rate = successes / occurrences if occurrences > 0 else 0
+                effective_lessons.append(
+                    {
+                        "lesson": refl["general_lesson"],
+                        "feedback_type": fb_type,
+                        "occurrences": occurrences,
+                        "success_rate": round(success_rate, 3),
+                    }
+                )
+
+        # Get total count
+        cursor = conn.execute("SELECT COUNT(*) FROM episodes")
+        total = cursor.fetchone()[0]
+
+        return {
+            "lessons_by_feedback_type": formatted,
+            "most_effective_lessons": effective_lessons,
+            "total_episodes": total,
+            "storage": str(DB_PATH),
+            "instruction": "Use these accumulated lessons to avoid repeating past mistakes.",
         }
-        for lesson in sorted(
-            lesson_patterns, key=lambda x: x.success_rate * x.occurrences, reverse=True
-        )[:10]
-    ]
 
-    return {
-        "lessons_by_feedback_type": formatted,
-        "most_effective_lessons": effective_lessons,
-        "total_episodes": len(episodes),
-        "storage": str(_get_lessons_file()),
-        "instruction": "Use these accumulated lessons to avoid repeating past mistakes. "
-        "Focus on most_effective_lessons which have high success rates.",
-    }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @mcp.tool()
@@ -885,47 +897,42 @@ def clear_episodes(
     Returns:
         Number of episodes cleared
     """
-    global _episodes_cache, _task_attempts, _episodes_loaded
+    try:
+        conn = _get_db()
 
-    episodes = _load_episodes()
-    initial_count = len(episodes)
+        # Get initial count
+        cursor = conn.execute("SELECT COUNT(*) FROM episodes")
+        initial = cursor.fetchone()[0]
 
-    if older_than_days is None and feedback_type is None:
-        # Clear all
-        _episodes_cache = []
-        _task_attempts.clear()
-        _save_episodes()
-        return {"cleared": initial_count, "remaining": 0}
+        if older_than_days is None and feedback_type is None:
+            conn.execute("DELETE FROM episodes")
+            conn.execute("DELETE FROM task_attempts")
+            conn.commit()
+            return {"cleared": initial, "remaining": 0}
 
-    # Filter what to keep
-    keep = []
-    now = datetime.now()
-
-    for episode in episodes:
-        should_remove = True
+        conditions = []
+        params: list[Any] = []
 
         if older_than_days is not None:
-            episode_time = datetime.fromisoformat(episode.created_at)
-            age_days = (now - episode_time).days
-            if age_days < older_than_days:
-                should_remove = False
+            conditions.append("created_at < datetime('now', ? || ' days')")
+            params.append(f"-{older_than_days}")
 
         if feedback_type is not None:
-            try:
-                fb_type = FeedbackType(feedback_type)
-                if episode.feedback_type != fb_type:
-                    should_remove = False
-            except ValueError:
-                pass
+            conditions.append("feedback_type = ?")
+            params.append(feedback_type)
 
-        if not should_remove:
-            keep.append(episode)
+        sql = f"DELETE FROM episodes WHERE {' AND '.join(conditions)}"
+        conn.execute(sql, params)
+        conn.commit()
 
-    cleared = initial_count - len(keep)
-    _episodes_cache = keep
-    _save_episodes()
+        # Get remaining count
+        cursor = conn.execute("SELECT COUNT(*) FROM episodes")
+        remaining = cursor.fetchone()[0]
 
-    return {"cleared": cleared, "remaining": len(_episodes_cache)}
+        return {"cleared": initial - remaining, "remaining": remaining}
+
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @mcp.tool()
@@ -936,63 +943,82 @@ def get_episode_stats() -> dict[str, Any]:
     Returns:
         Statistics including counts, success rates, common failure types
     """
-    episodes = _load_episodes()
-    if not episodes:
+    try:
+        conn = _get_db()
+
+        # Total count
+        cursor = conn.execute("SELECT COUNT(*) FROM episodes")
+        total = cursor.fetchone()[0]
+
+        if total == 0:
+            return {
+                "message": "No episodes stored yet.",
+                "total": 0,
+                "storage": str(DB_PATH),
+            }
+
+        # By outcome
+        cursor = conn.execute("SELECT outcome, COUNT(*) FROM episodes GROUP BY outcome")
+        outcomes = dict(cursor.fetchall())
+
+        # By feedback type
+        cursor = conn.execute(
+            "SELECT feedback_type, COUNT(*) FROM episodes GROUP BY feedback_type"
+        )
+        feedback_types = dict(cursor.fetchall())
+
+        # Success rate
+        success_rate = outcomes.get("success", 0) / total if total > 0 else 0
+
+        # Average attempts
+        cursor = conn.execute("SELECT AVG(attempt_number) FROM episodes")
+        avg_attempts = cursor.fetchone()[0] or 0
+
+        # Most common failures
+        cursor = conn.execute(
+            """
+            SELECT feedback_type, COUNT(*) as cnt FROM episodes
+            WHERE outcome = 'failure'
+            GROUP BY feedback_type
+            ORDER BY cnt DESC
+            LIMIT 5
+            """
+        )
+        failure_types = dict(cursor.fetchall())
+
+        # Lesson effectiveness
+        cursor = conn.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE lesson_applied_from IS NOT NULL) as applied,
+                COUNT(*) FILTER (WHERE led_to_success = 1) as effective
+            FROM episodes
+            """
+        )
+        row = cursor.fetchone()
+        lessons_applied = row[0] if row else 0
+        lessons_effective = row[1] if row else 0
+        effectiveness = (
+            lessons_effective / lessons_applied if lessons_applied > 0 else 0
+        )
+
         return {
-            "message": "No episodes stored yet.",
-            "total": 0,
-            "storage": str(DATA_DIR),
+            "total_episodes": total,
+            "by_outcome": outcomes,
+            "by_feedback_type": feedback_types,
+            "success_rate": round(success_rate, 3),
+            "average_attempts": round(avg_attempts, 2),
+            "most_common_failures": failure_types,
+            "lesson_effectiveness": {
+                "lessons_applied": lessons_applied,
+                "led_to_success": lessons_effective,
+                "effectiveness_rate": round(effectiveness, 3),
+            },
+            "storage": str(DB_PATH),
         }
 
-    # Count by outcome
-    outcomes = {}
-    for outcome in OutcomeType:
-        outcomes[outcome.value] = sum(1 for e in episodes if e.outcome == outcome)
-
-    # Count by feedback type
-    feedback_types = {}
-    for fb_type in FeedbackType:
-        count = sum(1 for e in episodes if e.feedback_type == fb_type)
-        if count > 0:
-            feedback_types[fb_type.value] = count
-
-    # Calculate success rate
-    total = len(episodes)
-    success_rate = outcomes.get("success", 0) / total if total > 0 else 0
-
-    # Average attempts per task
-    avg_attempts = sum(e.attempt_number for e in episodes) / total if total > 0 else 0
-
-    # Most common failure types (for failures only)
-    failure_types = {}
-    for e in episodes:
-        if e.outcome == OutcomeType.FAILURE:
-            fb = e.feedback_type.value
-            failure_types[fb] = failure_types.get(fb, 0) + 1
-
-    # Lesson effectiveness stats
-    lessons_applied = sum(1 for e in episodes if e.lesson_applied_from)
-    lessons_effective = sum(1 for e in episodes if e.led_to_success)
-    lesson_effectiveness = (
-        lessons_effective / lessons_applied if lessons_applied > 0 else 0
-    )
-
-    return {
-        "total_episodes": total,
-        "by_outcome": outcomes,
-        "by_feedback_type": feedback_types,
-        "success_rate": round(success_rate, 3),
-        "average_attempts": round(avg_attempts, 2),
-        "most_common_failures": dict(
-            sorted(failure_types.items(), key=lambda x: x[1], reverse=True)[:5]
-        ),
-        "lesson_effectiveness": {
-            "lessons_applied": lessons_applied,
-            "led_to_success": lessons_effective,
-            "effectiveness_rate": round(lesson_effectiveness, 3),
-        },
-        "storage": str(DATA_DIR),
-    }
+    except Exception as e:
+        return {"error": str(e), "storage": str(DB_PATH)}
 
 
 @mcp.tool()
@@ -1012,27 +1038,50 @@ def mark_lesson_effective(
     Returns:
         Confirmation and updated stats
     """
-    episodes = _load_episodes()
+    try:
+        conn = _get_db()
 
-    # Find the episode
-    episode = next((e for e in episodes if e.id == episode_id), None)
-    if not episode:
-        return {"error": f"Episode not found: {episode_id}"}
+        # Check episode exists
+        cursor = conn.execute(
+            "SELECT task FROM episodes WHERE episode_id = ?",
+            (episode_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return {"error": f"Episode not found: {episode_id}"}
 
-    episode.led_to_success = led_to_success
-    episode.effectiveness_score = max(0.0, min(1.0, effectiveness_score))
-    _save_episodes()
+        task = row[0]
+        score = max(0.0, min(1.0, effectiveness_score))
 
-    # Update lesson patterns
-    _update_lesson_patterns()
+        conn.execute(
+            """
+            UPDATE episodes SET
+                led_to_success = ?,
+                effectiveness_score = ?
+            WHERE episode_id = ?
+            """,
+            (1 if led_to_success else 0, score, episode_id),
+        )
 
-    return {
-        "episode_id": episode_id,
-        "led_to_success": led_to_success,
-        "effectiveness_score": episode.effectiveness_score,
-        "task": episode.task[:80],
-        "updated": True,
-    }
+        conn.execute(
+            """
+            INSERT INTO lesson_effectiveness (episode_id, led_to_success, effectiveness_score)
+            VALUES (?, ?, ?)
+            """,
+            (episode_id, 1 if led_to_success else 0, score),
+        )
+        conn.commit()
+
+        return {
+            "episode_id": episode_id,
+            "led_to_success": led_to_success,
+            "effectiveness_score": score,
+            "task": task[:80],
+            "updated": True,
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @mcp.tool()
@@ -1052,58 +1101,67 @@ def export_lessons(
     Returns:
         Exportable lessons in learner skill format
     """
-    _update_lesson_patterns()
-    lessons = _load_lessons()
+    try:
+        conn = _get_db()
 
-    # Filter
-    filtered = lessons
-    if feedback_type:
-        try:
-            fb_type = FeedbackType(feedback_type)
-            filtered = [
-                lesson for lesson in filtered if lesson.feedback_type == fb_type
-            ]
-        except ValueError:
-            pass
+        sql = """
+            SELECT reflection, feedback_type, task,
+                   COUNT(*) as occurrences,
+                   SUM(CASE WHEN led_to_success = 1 THEN 1.0 ELSE 0.0 END) /
+                       NULLIF(COUNT(CASE WHEN led_to_success IS NOT NULL THEN 1 END), 0) as success_rate
+            FROM episodes
+            WHERE reflection IS NOT NULL
+        """
+        params: list[Any] = []
 
-    filtered = [lesson for lesson in filtered if lesson.occurrences >= min_occurrences]
-    filtered = [
-        lesson for lesson in filtered if lesson.success_rate >= min_success_rate
-    ]
+        if feedback_type:
+            sql += " AND feedback_type = ?"
+            params.append(feedback_type)
 
-    # Sort by effectiveness
-    filtered.sort(
-        key=lambda lesson: lesson.success_rate * lesson.occurrences, reverse=True
-    )
+        sql += " GROUP BY reflection HAVING COUNT(*) >= ?"
+        params.append(min_occurrences)
 
-    # Format for learner skill
-    exportable = []
-    for lesson in filtered[:20]:  # Top 20
-        exportable.append(
-            {
-                "pattern": f"{lesson.feedback_type.value}: {lesson.lesson}",
-                "lesson": lesson.lesson,
-                "feedback_type": lesson.feedback_type.value,
-                "occurrences": lesson.occurrences,
-                "success_rate": round(lesson.success_rate, 3),
-                "examples": lesson.example_tasks[:3],
-                "confidence": min(
-                    1.0, lesson.occurrences * lesson.success_rate / 5
-                ),  # Confidence based on data
-            }
-        )
+        sql += " ORDER BY occurrences DESC LIMIT 50"
 
-    return {
-        "lessons": exportable,
-        "count": len(exportable),
-        "filters": {
-            "feedback_type": feedback_type,
-            "min_occurrences": min_occurrences,
-            "min_success_rate": min_success_rate,
-        },
-        "instruction": "Use these lessons in the learner skill to add to project memory. "
-        "High confidence lessons should be prioritized.",
-    }
+        cursor = conn.execute(sql, params)
+
+        lessons = []
+        for row in cursor.fetchall():
+            refl_json, fb_type, example_task, occurrences, success_rate = row
+            refl = _json_loads(refl_json)
+
+            if not refl or not refl.get("general_lesson"):
+                continue
+
+            sr = success_rate or 0
+            if sr < min_success_rate:
+                continue
+
+            lessons.append(
+                {
+                    "pattern": f"{fb_type}: {refl['general_lesson'][:50]}",
+                    "lesson": refl["general_lesson"],
+                    "feedback_type": fb_type,
+                    "occurrences": occurrences,
+                    "success_rate": round(sr, 3),
+                    "examples": [example_task[:80]],
+                    "confidence": min(1.0, occurrences * sr / 5),
+                }
+            )
+
+        return {
+            "lessons": lessons[:20],
+            "count": len(lessons[:20]),
+            "filters": {
+                "feedback_type": feedback_type,
+                "min_occurrences": min_occurrences,
+                "min_success_rate": min_success_rate,
+            },
+            "instruction": "Use these lessons in the learner skill to add to project memory.",
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @mcp.tool()
@@ -1121,31 +1179,60 @@ def link_episode_to_lesson(
     Returns:
         Confirmation of linkage
     """
-    episodes = _load_episodes()
+    try:
+        conn = _get_db()
 
-    episode = next((e for e in episodes if e.id == episode_id), None)
-    if not episode:
-        return {"error": f"Episode not found: {episode_id}"}
+        # Check both episodes exist
+        cursor = conn.execute(
+            "SELECT episode_id FROM episodes WHERE episode_id IN (?, ?)",
+            (episode_id, lesson_episode_id),
+        )
+        found = [r[0] for r in cursor.fetchall()]
 
-    lesson_episode = next((e for e in episodes if e.id == lesson_episode_id), None)
-    if not lesson_episode:
-        return {"error": f"Lesson episode not found: {lesson_episode_id}"}
+        if episode_id not in found:
+            return {"error": f"Episode not found: {episode_id}"}
+        if lesson_episode_id not in found:
+            return {"error": f"Lesson episode not found: {lesson_episode_id}"}
 
-    episode.lesson_applied_from = lesson_episode_id
-    _save_episodes()
+        # Update episode
+        conn.execute(
+            "UPDATE episodes SET lesson_applied_from = ? WHERE episode_id = ?",
+            (lesson_episode_id, episode_id),
+        )
 
-    return {
-        "episode_id": episode_id,
-        "linked_to": lesson_episode_id,
-        "lesson_applied": lesson_episode.reflection.general_lesson
-        if lesson_episode.reflection
-        else None,
-        "instruction": "After completing this task, call mark_lesson_effective to track if the lesson helped.",
-    }
+        # Add link
+        conn.execute(
+            """
+            INSERT INTO episode_links (episode_id, lesson_episode_id)
+            VALUES (?, ?)
+            """,
+            (episode_id, lesson_episode_id),
+        )
+        conn.commit()
+
+        # Get lesson text
+        cursor = conn.execute(
+            "SELECT reflection FROM episodes WHERE episode_id = ?",
+            (lesson_episode_id,),
+        )
+        row = cursor.fetchone()
+        refl = _json_loads(row[0]) if row else None
+        lesson_text = refl.get("general_lesson") if refl else None
+
+        return {
+            "episode_id": episode_id,
+            "linked_to": lesson_episode_id,
+            "lesson_applied": lesson_text,
+            "instruction": "After completing this task, call mark_lesson_effective to track if the lesson helped.",
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def main():
     """Entry point for the reflection MCP server."""
+    logger.info(f"Starting Reflection MCP server, database: {DB_PATH}")
     mcp.run()
 
 
