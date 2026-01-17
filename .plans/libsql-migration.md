@@ -16,7 +16,9 @@ Replace JSON file storage with libSQL.
 ```toml
 [project.dependencies]
 libsql-experimental = ">=0.0.50"
-sentence-transformers = ">=2.2.0"
+
+[project.optional-dependencies]
+full = ["sentence-transformers>=2.0.0"]
 ```
 
 ### Database Location

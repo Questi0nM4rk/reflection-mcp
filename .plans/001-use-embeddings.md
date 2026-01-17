@@ -25,7 +25,7 @@ except ImportError:
 
 ```toml
 [project.optional-dependencies]
-embeddings = ["sentence-transformers>=2.2.0", "numpy>=1.24.0"]
+full = ["sentence-transformers>=2.0.0"]
 ```
 
 ## Done Criteria

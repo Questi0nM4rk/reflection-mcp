@@ -29,10 +29,11 @@ import json
 import logging
 import os
 import struct
+from contextlib import contextmanager
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 from uuid import uuid4
 
 import libsql_experimental as libsql
@@ -104,15 +105,21 @@ class OutcomeType(str, Enum):
     FAILURE = "failure"
 
 
-def _get_db() -> libsql.Connection:
-    """Get database connection, creating schema if needed."""
+@contextmanager
+def _get_db() -> Generator[libsql.Connection, None, None]:
+    """Get database connection as context manager, creating schema if needed."""
     conn = libsql.connect(str(DB_PATH))
-    _init_schema(conn)
-    return conn
+    try:
+        _init_schema(conn)
+        yield conn
+    finally:
+        conn.close()
 
 
 def _init_schema(conn: libsql.Connection) -> None:
     """Initialize database schema."""
+    # Enable foreign key enforcement
+    conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(f"""
         CREATE TABLE IF NOT EXISTS episodes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,7 +148,7 @@ def _init_schema(conn: libsql.Connection) -> None:
             led_to_success INTEGER NOT NULL,
             effectiveness_score REAL DEFAULT 0.5,
             created_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (episode_id) REFERENCES episodes(episode_id)
+            FOREIGN KEY (episode_id) REFERENCES episodes(episode_id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS episode_links (
@@ -149,8 +156,8 @@ def _init_schema(conn: libsql.Connection) -> None:
             episode_id TEXT NOT NULL,
             lesson_episode_id TEXT NOT NULL,
             created_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (episode_id) REFERENCES episodes(episode_id),
-            FOREIGN KEY (lesson_episode_id) REFERENCES episodes(episode_id)
+            FOREIGN KEY (episode_id) REFERENCES episodes(episode_id) ON DELETE CASCADE,
+            FOREIGN KEY (lesson_episode_id) REFERENCES episodes(episode_id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS task_attempts (
@@ -207,29 +214,21 @@ def _json_dumps(val: dict | list | None) -> str | None:
 
 
 def _get_attempt_number(conn: libsql.Connection, task: str) -> int:
-    """Get and increment attempt number for a task."""
+    """Get and increment attempt number for a task using atomic UPSERT."""
     task_key = task[:100]
 
+    # Atomic UPSERT: insert with count=1, or increment on conflict
     cursor = conn.execute(
-        "SELECT attempt_count FROM task_attempts WHERE task_key = ?",
+        """
+        INSERT INTO task_attempts (task_key, attempt_count)
+        VALUES (?, 1)
+        ON CONFLICT(task_key) DO UPDATE SET attempt_count = attempt_count + 1
+        RETURNING attempt_count
+        """,
         (task_key,),
     )
     row = cursor.fetchone()
-
-    if row:
-        count = row[0] + 1
-        conn.execute(
-            "UPDATE task_attempts SET attempt_count = ? WHERE task_key = ?",
-            (count, task_key),
-        )
-    else:
-        count = 1
-        conn.execute(
-            "INSERT INTO task_attempts (task_key, attempt_count) VALUES (?, ?)",
-            (task_key, count),
-        )
-
-    return count
+    return row[0] if row else 1
 
 
 def _keyword_similarity(text1: str, text2: str) -> float:
@@ -400,68 +399,68 @@ def store_episode(
         Stored episode ID and confirmation
     """
     try:
-        conn = _get_db()
-        episode_id = str(uuid4())[:8]
+        with _get_db() as conn:
+            episode_id = str(uuid4())[:8]
 
-        try:
-            outcome_type = OutcomeType(outcome)
-        except ValueError:
-            outcome_type = OutcomeType.FAILURE
+            try:
+                outcome_type = OutcomeType(outcome)
+            except ValueError:
+                outcome_type = OutcomeType.FAILURE
 
-        try:
-            fb_type = FeedbackType(feedback_type)
-        except ValueError:
-            fb_type = FeedbackType.TEST_FAILURE
+            try:
+                fb_type = FeedbackType(feedback_type)
+            except ValueError:
+                fb_type = FeedbackType.TEST_FAILURE
 
-        attempt_number = _get_attempt_number(conn, task)
+            attempt_number = _get_attempt_number(conn, task)
 
-        # Generate embedding from task + approach + feedback
-        embed_text = f"{task} {approach} {feedback}"
-        embedding = _embed(embed_text)
+            # Generate embedding from task + approach + feedback
+            embed_text = f"{task} {approach} {feedback}"
+            embedding = _embed(embed_text)
 
-        now = datetime.now().isoformat()
+            now = datetime.now().isoformat()
 
-        conn.execute(
-            """
-            INSERT INTO episodes (
-                episode_id, task, approach, outcome, feedback, feedback_type,
-                reflection, code_context, file_path, attempt_number,
-                duration_seconds, tags, embedding, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                episode_id,
-                task,
-                approach,
-                outcome_type.value,
-                feedback[:2000],
-                fb_type.value,
-                _json_dumps(reflection),
-                code_context[:3000] if code_context else None,
-                file_path,
-                attempt_number,
-                duration_seconds,
-                _json_dumps(tags),
-                embedding,
-                now,
-            ),
-        )
-        conn.commit()
+            conn.execute(
+                """
+                INSERT INTO episodes (
+                    episode_id, task, approach, outcome, feedback, feedback_type,
+                    reflection, code_context, file_path, attempt_number,
+                    duration_seconds, tags, embedding, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    episode_id,
+                    task,
+                    approach,
+                    outcome_type.value,
+                    feedback[:2000],
+                    fb_type.value,
+                    _json_dumps(reflection),
+                    code_context[:3000] if code_context else None,
+                    file_path,
+                    attempt_number,
+                    duration_seconds,
+                    _json_dumps(tags),
+                    embedding,
+                    now,
+                ),
+            )
+            conn.commit()
 
-        # Count total episodes
-        cursor = conn.execute("SELECT COUNT(*) FROM episodes")
-        total = cursor.fetchone()[0]
+            # Count total episodes
+            cursor = conn.execute("SELECT COUNT(*) FROM episodes")
+            total = cursor.fetchone()[0]
 
-        return {
-            "episode_id": episode_id,
-            "task": task[:100],
-            "attempt_number": attempt_number,
-            "outcome": outcome_type.value,
-            "stored": True,
-            "total_episodes": total,
-            "lesson": reflection.get("general_lesson", ""),
-            "storage": str(DB_PATH),
-        }
+            return {
+                "episode_id": episode_id,
+                "task": task[:100],
+                "attempt_number": attempt_number,
+                "outcome": outcome_type.value,
+                "stored": True,
+                "total_episodes": total,
+                "lesson": reflection.get("general_lesson", ""),
+                "storage": str(DB_PATH),
+            }
 
     except Exception as e:
         logger.error(f"Failed to store episode: {e}")
@@ -490,173 +489,173 @@ def retrieve_episodes(
         Relevant past episodes with their reflections
     """
     try:
-        conn = _get_db()
-        top_k = min(max(top_k, 1), 20)
+        with _get_db() as conn:
+            top_k = min(max(top_k, 1), 20)
 
-        results = []
+            results = []
 
-        # Try vector search first
-        embed_text = f"{task} {error_pattern}"
-        embedding = _embed(embed_text)
+            # Try vector search first
+            embed_text = f"{task} {error_pattern}"
+            embedding = _embed(embed_text)
 
-        if embedding is not None:
-            try:
-                sql = """
-                    SELECT episode_id, task, approach, outcome, feedback_type,
-                           attempt_number, reflection, created_at,
-                           vector_distance_cos(embedding, ?) as distance
-                    FROM episodes
-                    WHERE embedding IS NOT NULL
-                """
-                params: list[Any] = [embedding]
+            if embedding is not None:
+                try:
+                    sql = """
+                        SELECT episode_id, task, approach, outcome, feedback_type,
+                               attempt_number, reflection, created_at,
+                               vector_distance_cos(embedding, ?) as distance
+                        FROM episodes
+                        WHERE embedding IS NOT NULL
+                    """
+                    params: list[Any] = [embedding]
 
+                    if feedback_type:
+                        sql += " AND feedback_type = ?"
+                        params.append(feedback_type)
+
+                    if not include_successes:
+                        sql += " AND outcome != 'success'"
+
+                    sql += " ORDER BY distance ASC LIMIT ?"
+                    params.append(top_k)
+
+                    cursor = conn.execute(sql, params)
+
+                    for row in cursor.fetchall():
+                        (
+                            ep_id,
+                            ep_task,
+                            ep_approach,
+                            ep_outcome,
+                            ep_fb_type,
+                            ep_attempt,
+                            ep_refl_json,
+                            ep_created,
+                            distance,
+                        ) = row
+
+                        refl = _json_loads(ep_refl_json)
+                        score = 1.0 / (1.0 + distance) if distance else 1.0
+
+                        results.append(
+                            {
+                                "episode_id": ep_id,
+                                "task": ep_task[:200],
+                                "approach": ep_approach[:200],
+                                "outcome": ep_outcome,
+                                "feedback_type": ep_fb_type,
+                                "attempt_number": ep_attempt,
+                                "similarity_score": round(score, 3),
+                                "reflection": {
+                                    "what_went_wrong": refl.get("what_went_wrong", "")
+                                    if refl
+                                    else "",
+                                    "root_cause": refl.get("root_cause", "")
+                                    if refl
+                                    else "",
+                                    "what_to_try_next": refl.get("what_to_try_next", "")
+                                    if refl
+                                    else "",
+                                    "general_lesson": refl.get("general_lesson", "")
+                                    if refl
+                                    else "",
+                                }
+                                if refl
+                                else None,
+                                "created_at": ep_created,
+                            }
+                        )
+
+                except Exception as e:
+                    logger.debug(f"Vector search failed: {e}")
+
+            # Fallback: keyword similarity
+            if not results:
+                sql = "SELECT episode_id, task, approach, outcome, feedback, feedback_type, attempt_number, reflection, created_at FROM episodes"
+                params = []
+
+                conditions = []
                 if feedback_type:
-                    sql += " AND feedback_type = ?"
+                    conditions.append("feedback_type = ?")
                     params.append(feedback_type)
 
                 if not include_successes:
-                    sql += " AND outcome != 'success'"
+                    conditions.append("outcome != 'success'")
 
-                sql += " ORDER BY distance ASC LIMIT ?"
-                params.append(top_k)
+                if conditions:
+                    sql += " WHERE " + " AND ".join(conditions)
+
+                sql += " LIMIT 100"
 
                 cursor = conn.execute(sql, params)
 
+                scored = []
                 for row in cursor.fetchall():
                     (
                         ep_id,
                         ep_task,
                         ep_approach,
                         ep_outcome,
+                        ep_feedback,
                         ep_fb_type,
                         ep_attempt,
                         ep_refl_json,
                         ep_created,
-                        distance,
                     ) = row
 
+                    task_sim = _keyword_similarity(task, ep_task)
+                    error_sim = (
+                        _keyword_similarity(error_pattern, ep_feedback)
+                        if error_pattern
+                        else 0
+                    )
+                    score = task_sim * 0.7 + error_sim * 0.3
+
                     refl = _json_loads(ep_refl_json)
-                    score = 1.0 / (1.0 + distance) if distance else 1.0
 
-                    results.append(
-                        {
-                            "episode_id": ep_id,
-                            "task": ep_task[:200],
-                            "approach": ep_approach[:200],
-                            "outcome": ep_outcome,
-                            "feedback_type": ep_fb_type,
-                            "attempt_number": ep_attempt,
-                            "similarity_score": round(score, 3),
-                            "reflection": {
-                                "what_went_wrong": refl.get("what_went_wrong", "")
+                    scored.append(
+                        (
+                            score,
+                            {
+                                "episode_id": ep_id,
+                                "task": ep_task[:200],
+                                "approach": ep_approach[:200],
+                                "outcome": ep_outcome,
+                                "feedback_type": ep_fb_type,
+                                "attempt_number": ep_attempt,
+                                "similarity_score": round(score, 3),
+                                "reflection": {
+                                    "what_went_wrong": refl.get("what_went_wrong", "")
+                                    if refl
+                                    else "",
+                                    "root_cause": refl.get("root_cause", "")
+                                    if refl
+                                    else "",
+                                    "what_to_try_next": refl.get("what_to_try_next", "")
+                                    if refl
+                                    else "",
+                                    "general_lesson": refl.get("general_lesson", "")
+                                    if refl
+                                    else "",
+                                }
                                 if refl
-                                else "",
-                                "root_cause": refl.get("root_cause", "")
-                                if refl
-                                else "",
-                                "what_to_try_next": refl.get("what_to_try_next", "")
-                                if refl
-                                else "",
-                                "general_lesson": refl.get("general_lesson", "")
-                                if refl
-                                else "",
-                            }
-                            if refl
-                            else None,
-                            "created_at": ep_created,
-                        }
+                                else None,
+                                "created_at": ep_created,
+                            },
+                        )
                     )
 
-            except Exception as e:
-                logger.debug(f"Vector search failed: {e}")
+                scored.sort(key=lambda x: x[0], reverse=True)
+                results = [ep for _, ep in scored[:top_k]]
 
-        # Fallback: keyword similarity
-        if not results:
-            sql = "SELECT episode_id, task, approach, outcome, feedback, feedback_type, attempt_number, reflection, created_at FROM episodes"
-            params = []
-
-            conditions = []
-            if feedback_type:
-                conditions.append("feedback_type = ?")
-                params.append(feedback_type)
-
-            if not include_successes:
-                conditions.append("outcome != 'success'")
-
-            if conditions:
-                sql += " WHERE " + " AND ".join(conditions)
-
-            sql += " LIMIT 100"
-
-            cursor = conn.execute(sql, params)
-
-            scored = []
-            for row in cursor.fetchall():
-                (
-                    ep_id,
-                    ep_task,
-                    ep_approach,
-                    ep_outcome,
-                    ep_feedback,
-                    ep_fb_type,
-                    ep_attempt,
-                    ep_refl_json,
-                    ep_created,
-                ) = row
-
-                task_sim = _keyword_similarity(task, ep_task)
-                error_sim = (
-                    _keyword_similarity(error_pattern, ep_feedback)
-                    if error_pattern
-                    else 0
-                )
-                score = task_sim * 0.7 + error_sim * 0.3
-
-                refl = _json_loads(ep_refl_json)
-
-                scored.append(
-                    (
-                        score,
-                        {
-                            "episode_id": ep_id,
-                            "task": ep_task[:200],
-                            "approach": ep_approach[:200],
-                            "outcome": ep_outcome,
-                            "feedback_type": ep_fb_type,
-                            "attempt_number": ep_attempt,
-                            "similarity_score": round(score, 3),
-                            "reflection": {
-                                "what_went_wrong": refl.get("what_went_wrong", "")
-                                if refl
-                                else "",
-                                "root_cause": refl.get("root_cause", "")
-                                if refl
-                                else "",
-                                "what_to_try_next": refl.get("what_to_try_next", "")
-                                if refl
-                                else "",
-                                "general_lesson": refl.get("general_lesson", "")
-                                if refl
-                                else "",
-                            }
-                            if refl
-                            else None,
-                            "created_at": ep_created,
-                        },
-                    )
-                )
-
-            scored.sort(key=lambda x: x[0], reverse=True)
-            results = [ep for _, ep in scored[:top_k]]
-
-        return {
-            "query_task": task[:100],
-            "query_error": error_pattern[:100] if error_pattern else None,
-            "episodes": results,
-            "count": len(results),
-            "instruction": "Apply lessons from these past episodes to your current approach. "
-            "Focus on the general_lesson and what_to_try_next fields.",
-        }
+            return {
+                "query_task": task[:100],
+                "query_error": error_pattern[:100] if error_pattern else None,
+                "episodes": results,
+                "count": len(results),
+                "instruction": "Apply lessons from these past episodes to your current approach. "
+                "Focus on the general_lesson and what_to_try_next fields.",
+            }
 
     except Exception as e:
         logger.error(f"Retrieve failed: {e}")
@@ -731,77 +730,77 @@ def get_reflection_history(
         History of reflections with outcomes
     """
     try:
-        conn = _get_db()
-        limit = min(max(limit, 1), 50)
+        with _get_db() as conn:
+            limit = min(max(limit, 1), 50)
 
-        if task:
+            if task:
+                cursor = conn.execute(
+                    """
+                    SELECT episode_id, task, outcome, feedback_type, attempt_number,
+                           reflection, created_at
+                    FROM episodes
+                    WHERE task LIKE ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (f"%{task}%", limit),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT episode_id, task, outcome, feedback_type, attempt_number,
+                           reflection, created_at
+                    FROM episodes
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                )
+
+            history = []
+            for row in cursor.fetchall():
+                (
+                    ep_id,
+                    ep_task,
+                    ep_outcome,
+                    ep_fb_type,
+                    ep_attempt,
+                    ep_refl_json,
+                    ep_created,
+                ) = row
+                refl = _json_loads(ep_refl_json)
+
+                history.append(
+                    {
+                        "episode_id": ep_id,
+                        "task": ep_task[:100],
+                        "outcome": ep_outcome,
+                        "feedback_type": ep_fb_type,
+                        "attempt_number": ep_attempt,
+                        "lesson": refl.get("general_lesson") if refl else None,
+                        "created_at": ep_created,
+                    }
+                )
+
+            # Calculate stats
             cursor = conn.execute(
                 """
-                SELECT episode_id, task, outcome, feedback_type, attempt_number,
-                       reflection, created_at
-                FROM episodes
+                SELECT outcome, COUNT(*) FROM episodes
                 WHERE task LIKE ?
-                ORDER BY created_at DESC
-                LIMIT ?
+                GROUP BY outcome
                 """,
-                (f"%{task}%", limit),
+                (f"%{task}%" if task else "%",),
             )
-        else:
-            cursor = conn.execute(
-                """
-                SELECT episode_id, task, outcome, feedback_type, attempt_number,
-                       reflection, created_at
-                FROM episodes
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            )
+            outcome_counts = dict(cursor.fetchall())
 
-        history = []
-        for row in cursor.fetchall():
-            (
-                ep_id,
-                ep_task,
-                ep_outcome,
-                ep_fb_type,
-                ep_attempt,
-                ep_refl_json,
-                ep_created,
-            ) = row
-            refl = _json_loads(ep_refl_json)
+            stats = {
+                "total": sum(outcome_counts.values()),
+                "successes": outcome_counts.get("success", 0),
+                "partial": outcome_counts.get("partial", 0),
+                "failures": outcome_counts.get("failure", 0),
+            }
 
-            history.append(
-                {
-                    "episode_id": ep_id,
-                    "task": ep_task[:100],
-                    "outcome": ep_outcome,
-                    "feedback_type": ep_fb_type,
-                    "attempt_number": ep_attempt,
-                    "lesson": refl.get("general_lesson") if refl else None,
-                    "created_at": ep_created,
-                }
-            )
-
-        # Calculate stats
-        cursor = conn.execute(
-            """
-            SELECT outcome, COUNT(*) FROM episodes
-            WHERE task LIKE ?
-            GROUP BY outcome
-            """,
-            (f"%{task}%" if task else "%",),
-        )
-        outcome_counts = dict(cursor.fetchall())
-
-        stats = {
-            "total": sum(outcome_counts.values()),
-            "successes": outcome_counts.get("success", 0),
-            "partial": outcome_counts.get("partial", 0),
-            "failures": outcome_counts.get("failure", 0),
-        }
-
-        return {"history": history, "stats": stats, "filter": task}
+            return {"history": history, "stats": stats, "filter": task}
 
     except Exception as e:
         return {"history": [], "stats": {}, "error": str(e)}
@@ -816,67 +815,66 @@ def get_common_lessons() -> dict[str, Any]:
         Common lessons learned, organized by feedback type
     """
     try:
-        conn = _get_db()
+        with _get_db() as conn:
+            cursor = conn.execute(
+                "SELECT feedback_type, reflection FROM episodes WHERE reflection IS NOT NULL"
+            )
 
-        cursor = conn.execute(
-            "SELECT feedback_type, reflection FROM episodes WHERE reflection IS NOT NULL"
-        )
+            lessons_by_type: dict[str, list[str]] = {}
+            for row in cursor.fetchall():
+                fb_type, refl_json = row
+                refl = _json_loads(refl_json)
+                if refl and refl.get("general_lesson"):
+                    if fb_type not in lessons_by_type:
+                        lessons_by_type[fb_type] = []
+                    lessons_by_type[fb_type].append(refl["general_lesson"])
 
-        lessons_by_type: dict[str, list[str]] = {}
-        for row in cursor.fetchall():
-            fb_type, refl_json = row
-            refl = _json_loads(refl_json)
-            if refl and refl.get("general_lesson"):
-                if fb_type not in lessons_by_type:
-                    lessons_by_type[fb_type] = []
-                lessons_by_type[fb_type].append(refl["general_lesson"])
+            # Deduplicate
+            formatted = {}
+            for fb_type, lessons in lessons_by_type.items():
+                unique = list(set(lessons))
+                formatted[fb_type] = unique[:10]
 
-        # Deduplicate
-        formatted = {}
-        for fb_type, lessons in lessons_by_type.items():
-            unique = list(set(lessons))
-            formatted[fb_type] = unique[:10]
+            # Get lesson effectiveness
+            cursor = conn.execute(
+                """
+                SELECT reflection, feedback_type,
+                       COUNT(*) as occurrences,
+                       SUM(CASE WHEN led_to_success = 1 THEN 1 ELSE 0 END) as successes
+                FROM episodes
+                WHERE reflection IS NOT NULL AND led_to_success IS NOT NULL
+                GROUP BY reflection
+                ORDER BY occurrences DESC
+                LIMIT 10
+                """
+            )
 
-        # Get lesson effectiveness
-        cursor = conn.execute(
-            """
-            SELECT reflection, feedback_type,
-                   COUNT(*) as occurrences,
-                   SUM(CASE WHEN led_to_success = 1 THEN 1 ELSE 0 END) as successes
-            FROM episodes
-            WHERE reflection IS NOT NULL AND led_to_success IS NOT NULL
-            GROUP BY reflection
-            ORDER BY occurrences DESC
-            LIMIT 10
-            """
-        )
+            effective_lessons = []
+            for row in cursor.fetchall():
+                refl_json, fb_type, occurrences, successes = row
+                refl = _json_loads(refl_json)
+                if refl and refl.get("general_lesson"):
+                    success_rate = successes / occurrences if occurrences > 0 else 0
+                    effective_lessons.append(
+                        {
+                            "lesson": refl["general_lesson"],
+                            "feedback_type": fb_type,
+                            "occurrences": occurrences,
+                            "success_rate": round(success_rate, 3),
+                        }
+                    )
 
-        effective_lessons = []
-        for row in cursor.fetchall():
-            refl_json, fb_type, occurrences, successes = row
-            refl = _json_loads(refl_json)
-            if refl and refl.get("general_lesson"):
-                success_rate = successes / occurrences if occurrences > 0 else 0
-                effective_lessons.append(
-                    {
-                        "lesson": refl["general_lesson"],
-                        "feedback_type": fb_type,
-                        "occurrences": occurrences,
-                        "success_rate": round(success_rate, 3),
-                    }
-                )
+            # Get total count
+            cursor = conn.execute("SELECT COUNT(*) FROM episodes")
+            total = cursor.fetchone()[0]
 
-        # Get total count
-        cursor = conn.execute("SELECT COUNT(*) FROM episodes")
-        total = cursor.fetchone()[0]
-
-        return {
-            "lessons_by_feedback_type": formatted,
-            "most_effective_lessons": effective_lessons,
-            "total_episodes": total,
-            "storage": str(DB_PATH),
-            "instruction": "Use these accumulated lessons to avoid repeating past mistakes.",
-        }
+            return {
+                "lessons_by_feedback_type": formatted,
+                "most_effective_lessons": effective_lessons,
+                "total_episodes": total,
+                "storage": str(DB_PATH),
+                "instruction": "Use these accumulated lessons to avoid repeating past mistakes.",
+            }
 
     except Exception as e:
         return {"error": str(e)}
@@ -898,38 +896,37 @@ def clear_episodes(
         Number of episodes cleared
     """
     try:
-        conn = _get_db()
+        with _get_db() as conn:
+            # Get initial count
+            cursor = conn.execute("SELECT COUNT(*) FROM episodes")
+            initial = cursor.fetchone()[0]
 
-        # Get initial count
-        cursor = conn.execute("SELECT COUNT(*) FROM episodes")
-        initial = cursor.fetchone()[0]
+            if older_than_days is None and feedback_type is None:
+                conn.execute("DELETE FROM episodes")
+                conn.execute("DELETE FROM task_attempts")
+                conn.commit()
+                return {"cleared": initial, "remaining": 0}
 
-        if older_than_days is None and feedback_type is None:
-            conn.execute("DELETE FROM episodes")
-            conn.execute("DELETE FROM task_attempts")
+            conditions = []
+            params: list[Any] = []
+
+            if older_than_days is not None:
+                conditions.append("created_at < datetime('now', ? || ' days')")
+                params.append(f"-{older_than_days}")
+
+            if feedback_type is not None:
+                conditions.append("feedback_type = ?")
+                params.append(feedback_type)
+
+            sql = f"DELETE FROM episodes WHERE {' AND '.join(conditions)}"
+            conn.execute(sql, params)
             conn.commit()
-            return {"cleared": initial, "remaining": 0}
 
-        conditions = []
-        params: list[Any] = []
+            # Get remaining count
+            cursor = conn.execute("SELECT COUNT(*) FROM episodes")
+            remaining = cursor.fetchone()[0]
 
-        if older_than_days is not None:
-            conditions.append("created_at < datetime('now', ? || ' days')")
-            params.append(f"-{older_than_days}")
-
-        if feedback_type is not None:
-            conditions.append("feedback_type = ?")
-            params.append(feedback_type)
-
-        sql = f"DELETE FROM episodes WHERE {' AND '.join(conditions)}"
-        conn.execute(sql, params)
-        conn.commit()
-
-        # Get remaining count
-        cursor = conn.execute("SELECT COUNT(*) FROM episodes")
-        remaining = cursor.fetchone()[0]
-
-        return {"cleared": initial - remaining, "remaining": remaining}
+            return {"cleared": initial - remaining, "remaining": remaining}
 
     except Exception as e:
         return {"error": str(e)}
@@ -944,78 +941,79 @@ def get_episode_stats() -> dict[str, Any]:
         Statistics including counts, success rates, common failure types
     """
     try:
-        conn = _get_db()
+        with _get_db() as conn:
+            # Total count
+            cursor = conn.execute("SELECT COUNT(*) FROM episodes")
+            total = cursor.fetchone()[0]
 
-        # Total count
-        cursor = conn.execute("SELECT COUNT(*) FROM episodes")
-        total = cursor.fetchone()[0]
+            if total == 0:
+                return {
+                    "message": "No episodes stored yet.",
+                    "total": 0,
+                    "storage": str(DB_PATH),
+                }
 
-        if total == 0:
+            # By outcome
+            cursor = conn.execute(
+                "SELECT outcome, COUNT(*) FROM episodes GROUP BY outcome"
+            )
+            outcomes = dict(cursor.fetchall())
+
+            # By feedback type
+            cursor = conn.execute(
+                "SELECT feedback_type, COUNT(*) FROM episodes GROUP BY feedback_type"
+            )
+            feedback_types = dict(cursor.fetchall())
+
+            # Success rate
+            success_rate = outcomes.get("success", 0) / total if total > 0 else 0
+
+            # Average attempts
+            cursor = conn.execute("SELECT AVG(attempt_number) FROM episodes")
+            avg_attempts = cursor.fetchone()[0] or 0
+
+            # Most common failures
+            cursor = conn.execute(
+                """
+                SELECT feedback_type, COUNT(*) as cnt FROM episodes
+                WHERE outcome = 'failure'
+                GROUP BY feedback_type
+                ORDER BY cnt DESC
+                LIMIT 5
+                """
+            )
+            failure_types = dict(cursor.fetchall())
+
+            # Lesson effectiveness
+            cursor = conn.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE lesson_applied_from IS NOT NULL) as applied,
+                    COUNT(*) FILTER (WHERE led_to_success = 1) as effective
+                FROM episodes
+                """
+            )
+            row = cursor.fetchone()
+            lessons_applied = row[0] if row else 0
+            lessons_effective = row[1] if row else 0
+            effectiveness = (
+                lessons_effective / lessons_applied if lessons_applied > 0 else 0
+            )
+
             return {
-                "message": "No episodes stored yet.",
-                "total": 0,
+                "total_episodes": total,
+                "by_outcome": outcomes,
+                "by_feedback_type": feedback_types,
+                "success_rate": round(success_rate, 3),
+                "average_attempts": round(avg_attempts, 2),
+                "most_common_failures": failure_types,
+                "lesson_effectiveness": {
+                    "lessons_applied": lessons_applied,
+                    "led_to_success": lessons_effective,
+                    "effectiveness_rate": round(effectiveness, 3),
+                },
                 "storage": str(DB_PATH),
             }
-
-        # By outcome
-        cursor = conn.execute("SELECT outcome, COUNT(*) FROM episodes GROUP BY outcome")
-        outcomes = dict(cursor.fetchall())
-
-        # By feedback type
-        cursor = conn.execute(
-            "SELECT feedback_type, COUNT(*) FROM episodes GROUP BY feedback_type"
-        )
-        feedback_types = dict(cursor.fetchall())
-
-        # Success rate
-        success_rate = outcomes.get("success", 0) / total if total > 0 else 0
-
-        # Average attempts
-        cursor = conn.execute("SELECT AVG(attempt_number) FROM episodes")
-        avg_attempts = cursor.fetchone()[0] or 0
-
-        # Most common failures
-        cursor = conn.execute(
-            """
-            SELECT feedback_type, COUNT(*) as cnt FROM episodes
-            WHERE outcome = 'failure'
-            GROUP BY feedback_type
-            ORDER BY cnt DESC
-            LIMIT 5
-            """
-        )
-        failure_types = dict(cursor.fetchall())
-
-        # Lesson effectiveness
-        cursor = conn.execute(
-            """
-            SELECT
-                COUNT(*) FILTER (WHERE lesson_applied_from IS NOT NULL) as applied,
-                COUNT(*) FILTER (WHERE led_to_success = 1) as effective
-            FROM episodes
-            """
-        )
-        row = cursor.fetchone()
-        lessons_applied = row[0] if row else 0
-        lessons_effective = row[1] if row else 0
-        effectiveness = (
-            lessons_effective / lessons_applied if lessons_applied > 0 else 0
-        )
-
-        return {
-            "total_episodes": total,
-            "by_outcome": outcomes,
-            "by_feedback_type": feedback_types,
-            "success_rate": round(success_rate, 3),
-            "average_attempts": round(avg_attempts, 2),
-            "most_common_failures": failure_types,
-            "lesson_effectiveness": {
-                "lessons_applied": lessons_applied,
-                "led_to_success": lessons_effective,
-                "effectiveness_rate": round(effectiveness, 3),
-            },
-            "storage": str(DB_PATH),
-        }
 
     except Exception as e:
         return {"error": str(e), "storage": str(DB_PATH)}
@@ -1039,46 +1037,45 @@ def mark_lesson_effective(
         Confirmation and updated stats
     """
     try:
-        conn = _get_db()
+        with _get_db() as conn:
+            # Check episode exists
+            cursor = conn.execute(
+                "SELECT task FROM episodes WHERE episode_id = ?",
+                (episode_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return {"error": f"Episode not found: {episode_id}"}
 
-        # Check episode exists
-        cursor = conn.execute(
-            "SELECT task FROM episodes WHERE episode_id = ?",
-            (episode_id,),
-        )
-        row = cursor.fetchone()
-        if not row:
-            return {"error": f"Episode not found: {episode_id}"}
+            task = row[0]
+            score = max(0.0, min(1.0, effectiveness_score))
 
-        task = row[0]
-        score = max(0.0, min(1.0, effectiveness_score))
+            conn.execute(
+                """
+                UPDATE episodes SET
+                    led_to_success = ?,
+                    effectiveness_score = ?
+                WHERE episode_id = ?
+                """,
+                (1 if led_to_success else 0, score, episode_id),
+            )
 
-        conn.execute(
-            """
-            UPDATE episodes SET
-                led_to_success = ?,
-                effectiveness_score = ?
-            WHERE episode_id = ?
-            """,
-            (1 if led_to_success else 0, score, episode_id),
-        )
+            conn.execute(
+                """
+                INSERT INTO lesson_effectiveness (episode_id, led_to_success, effectiveness_score)
+                VALUES (?, ?, ?)
+                """,
+                (episode_id, 1 if led_to_success else 0, score),
+            )
+            conn.commit()
 
-        conn.execute(
-            """
-            INSERT INTO lesson_effectiveness (episode_id, led_to_success, effectiveness_score)
-            VALUES (?, ?, ?)
-            """,
-            (episode_id, 1 if led_to_success else 0, score),
-        )
-        conn.commit()
-
-        return {
-            "episode_id": episode_id,
-            "led_to_success": led_to_success,
-            "effectiveness_score": score,
-            "task": task[:80],
-            "updated": True,
-        }
+            return {
+                "episode_id": episode_id,
+                "led_to_success": led_to_success,
+                "effectiveness_score": score,
+                "task": task[:80],
+                "updated": True,
+            }
 
     except Exception as e:
         return {"error": str(e)}
@@ -1102,63 +1099,62 @@ def export_lessons(
         Exportable lessons in learner skill format
     """
     try:
-        conn = _get_db()
+        with _get_db() as conn:
+            sql = """
+                SELECT reflection, feedback_type, task,
+                       COUNT(*) as occurrences,
+                       SUM(CASE WHEN led_to_success = 1 THEN 1.0 ELSE 0.0 END) /
+                           NULLIF(COUNT(CASE WHEN led_to_success IS NOT NULL THEN 1 END), 0) as success_rate
+                FROM episodes
+                WHERE reflection IS NOT NULL
+            """
+            params: list[Any] = []
 
-        sql = """
-            SELECT reflection, feedback_type, task,
-                   COUNT(*) as occurrences,
-                   SUM(CASE WHEN led_to_success = 1 THEN 1.0 ELSE 0.0 END) /
-                       NULLIF(COUNT(CASE WHEN led_to_success IS NOT NULL THEN 1 END), 0) as success_rate
-            FROM episodes
-            WHERE reflection IS NOT NULL
-        """
-        params: list[Any] = []
+            if feedback_type:
+                sql += " AND feedback_type = ?"
+                params.append(feedback_type)
 
-        if feedback_type:
-            sql += " AND feedback_type = ?"
-            params.append(feedback_type)
+            sql += " GROUP BY reflection HAVING COUNT(*) >= ?"
+            params.append(min_occurrences)
 
-        sql += " GROUP BY reflection HAVING COUNT(*) >= ?"
-        params.append(min_occurrences)
+            sql += " ORDER BY occurrences DESC LIMIT 50"
 
-        sql += " ORDER BY occurrences DESC LIMIT 50"
+            cursor = conn.execute(sql, params)
 
-        cursor = conn.execute(sql, params)
+            lessons = []
+            for row in cursor.fetchall():
+                refl_json, fb_type, example_task, occurrences, success_rate = row
+                refl = _json_loads(refl_json)
 
-        lessons = []
-        for row in cursor.fetchall():
-            refl_json, fb_type, example_task, occurrences, success_rate = row
-            refl = _json_loads(refl_json)
+                if not refl or not refl.get("general_lesson"):
+                    continue
 
-            if not refl or not refl.get("general_lesson"):
-                continue
+                sr = success_rate or 0
+                if sr < min_success_rate:
+                    continue
 
-            sr = success_rate or 0
-            if sr < min_success_rate:
-                continue
+                lessons.append(
+                    {
+                        "pattern": f"{fb_type}: {refl['general_lesson'][:50]}",
+                        "lesson": refl["general_lesson"],
+                        "feedback_type": fb_type,
+                        "occurrences": occurrences,
+                        "success_rate": round(sr, 3),
+                        "examples": [example_task[:80]],
+                        "confidence": min(1.0, occurrences * sr / 5),
+                    }
+                )
 
-            lessons.append(
-                {
-                    "pattern": f"{fb_type}: {refl['general_lesson'][:50]}",
-                    "lesson": refl["general_lesson"],
-                    "feedback_type": fb_type,
-                    "occurrences": occurrences,
-                    "success_rate": round(sr, 3),
-                    "examples": [example_task[:80]],
-                    "confidence": min(1.0, occurrences * sr / 5),
-                }
-            )
-
-        return {
-            "lessons": lessons[:20],
-            "count": len(lessons[:20]),
-            "filters": {
-                "feedback_type": feedback_type,
-                "min_occurrences": min_occurrences,
-                "min_success_rate": min_success_rate,
-            },
-            "instruction": "Use these lessons in the learner skill to add to project memory.",
-        }
+            return {
+                "lessons": lessons[:20],
+                "count": len(lessons[:20]),
+                "filters": {
+                    "feedback_type": feedback_type,
+                    "min_occurrences": min_occurrences,
+                    "min_success_rate": min_success_rate,
+                },
+                "instruction": "Use these lessons in the learner skill to add to project memory.",
+            }
 
     except Exception as e:
         return {"error": str(e)}
@@ -1180,51 +1176,50 @@ def link_episode_to_lesson(
         Confirmation of linkage
     """
     try:
-        conn = _get_db()
+        with _get_db() as conn:
+            # Check both episodes exist
+            cursor = conn.execute(
+                "SELECT episode_id FROM episodes WHERE episode_id IN (?, ?)",
+                (episode_id, lesson_episode_id),
+            )
+            found = [r[0] for r in cursor.fetchall()]
 
-        # Check both episodes exist
-        cursor = conn.execute(
-            "SELECT episode_id FROM episodes WHERE episode_id IN (?, ?)",
-            (episode_id, lesson_episode_id),
-        )
-        found = [r[0] for r in cursor.fetchall()]
+            if episode_id not in found:
+                return {"error": f"Episode not found: {episode_id}"}
+            if lesson_episode_id not in found:
+                return {"error": f"Lesson episode not found: {lesson_episode_id}"}
 
-        if episode_id not in found:
-            return {"error": f"Episode not found: {episode_id}"}
-        if lesson_episode_id not in found:
-            return {"error": f"Lesson episode not found: {lesson_episode_id}"}
+            # Update episode
+            conn.execute(
+                "UPDATE episodes SET lesson_applied_from = ? WHERE episode_id = ?",
+                (lesson_episode_id, episode_id),
+            )
 
-        # Update episode
-        conn.execute(
-            "UPDATE episodes SET lesson_applied_from = ? WHERE episode_id = ?",
-            (lesson_episode_id, episode_id),
-        )
+            # Add link
+            conn.execute(
+                """
+                INSERT INTO episode_links (episode_id, lesson_episode_id)
+                VALUES (?, ?)
+                """,
+                (episode_id, lesson_episode_id),
+            )
+            conn.commit()
 
-        # Add link
-        conn.execute(
-            """
-            INSERT INTO episode_links (episode_id, lesson_episode_id)
-            VALUES (?, ?)
-            """,
-            (episode_id, lesson_episode_id),
-        )
-        conn.commit()
+            # Get lesson text
+            cursor = conn.execute(
+                "SELECT reflection FROM episodes WHERE episode_id = ?",
+                (lesson_episode_id,),
+            )
+            row = cursor.fetchone()
+            refl = _json_loads(row[0]) if row else None
+            lesson_text = refl.get("general_lesson") if refl else None
 
-        # Get lesson text
-        cursor = conn.execute(
-            "SELECT reflection FROM episodes WHERE episode_id = ?",
-            (lesson_episode_id,),
-        )
-        row = cursor.fetchone()
-        refl = _json_loads(row[0]) if row else None
-        lesson_text = refl.get("general_lesson") if refl else None
-
-        return {
-            "episode_id": episode_id,
-            "linked_to": lesson_episode_id,
-            "lesson_applied": lesson_text,
-            "instruction": "After completing this task, call mark_lesson_effective to track if the lesson helped.",
-        }
+            return {
+                "episode_id": episode_id,
+                "linked_to": lesson_episode_id,
+                "lesson_applied": lesson_text,
+                "instruction": "After completing this task, call mark_lesson_effective to track if the lesson helped.",
+            }
 
     except Exception as e:
         return {"error": str(e)}
