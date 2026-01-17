@@ -59,14 +59,15 @@ mcp = FastMCP(
     "Use this when code fails tests or reviews to improve on subsequent attempts.",
 )
 
-# Lazy-loaded singleton
-_embedding_model = None
+# Lazy-loaded singleton (use sentinel to distinguish "not loaded" from "unavailable")
+_NOT_LOADED = object()
+_embedding_model: object = _NOT_LOADED
 
 
 def _get_embedding_model():
     """Get or load the sentence transformer model."""
     global _embedding_model
-    if _embedding_model is not None:
+    if _embedding_model is not _NOT_LOADED:
         return _embedding_model
 
     try:
@@ -229,6 +230,11 @@ def _get_attempt_number(conn: libsql.Connection, task: str) -> int:
     )
     row = cursor.fetchone()
     return row[0] if row else 1
+
+
+def _escape_like(s: str) -> str:
+    """Escape SQL LIKE wildcards for literal matching."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _keyword_similarity(text1: str, text2: str) -> float:
@@ -734,16 +740,17 @@ def get_reflection_history(
             limit = min(max(limit, 1), 50)
 
             if task:
+                escaped_task = _escape_like(task)
                 cursor = conn.execute(
                     """
                     SELECT episode_id, task, outcome, feedback_type, attempt_number,
                            reflection, created_at
                     FROM episodes
-                    WHERE task LIKE ?
+                    WHERE task LIKE ? ESCAPE '\\'
                     ORDER BY created_at DESC
                     LIMIT ?
                     """,
-                    (f"%{task}%", limit),
+                    (f"%{escaped_task}%", limit),
                 )
             else:
                 cursor = conn.execute(
@@ -783,14 +790,19 @@ def get_reflection_history(
                 )
 
             # Calculate stats
-            cursor = conn.execute(
-                """
-                SELECT outcome, COUNT(*) FROM episodes
-                WHERE task LIKE ?
-                GROUP BY outcome
-                """,
-                (f"%{task}%" if task else "%",),
-            )
+            if task:
+                cursor = conn.execute(
+                    """
+                    SELECT outcome, COUNT(*) FROM episodes
+                    WHERE task LIKE ? ESCAPE '\\'
+                    GROUP BY outcome
+                    """,
+                    (f"%{escaped_task}%",),
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT outcome, COUNT(*) FROM episodes GROUP BY outcome"
+                )
             outcome_counts = dict(cursor.fetchall())
 
             stats = {
