@@ -13,6 +13,11 @@ dependencies = [
 full = [
     "sentence-transformers>=2.0.0",
 ]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pyright>=1.1.0",
+]
 
 [project.scripts]
 reflection-mcp = "reflection_mcp.server:main"
@@ -23,3 +28,19 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/reflection_mcp"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
+# Strict checks for None handling
+reportOptionalMemberAccess = "error"
+reportOptionalCall = "error"
+reportOptionalIterable = "error"
+reportOptionalContextManager = "error"
+reportOptionalOperand = "error"
+reportOptionalSubscript = "error"
+# Catch possibly unbound variables
+reportPossiblyUnboundVariable = "error"
+reportUnusedImport = "error"
+reportUnusedVariable = "warning"
