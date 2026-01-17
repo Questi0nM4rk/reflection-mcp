@@ -40,7 +40,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Persistent storage directory
-DATA_DIR = Path(os.environ.get("CODEAGENT_HOME", Path.home() / ".codeagent")) / "data" / "reflection-episodes"
+DATA_DIR = (
+    Path(os.environ.get("CODEAGENT_HOME", Path.home() / ".codeagent"))
+    / "data"
+    / "reflection-episodes"
+)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Initialize FastMCP server
@@ -158,7 +162,9 @@ def _episode_to_dict(episode: Episode) -> dict:
             "general_lesson": episode.reflection.general_lesson,
             "confidence": episode.reflection.confidence,
             "created_at": episode.reflection.created_at,
-        } if episode.reflection else None,
+        }
+        if episode.reflection
+        else None,
         "code_context": episode.code_context,
         "file_path": episode.file_path,
         "attempt_number": episode.attempt_number,
@@ -288,7 +294,9 @@ def _load_lessons() -> list[LessonPattern]:
         try:
             with open(lessons_file, "r") as f:
                 data = json.load(f)
-            _lessons_cache = [_dict_to_lesson(l) for l in data.get("lessons", [])]
+            _lessons_cache = [
+                _dict_to_lesson(lesson) for lesson in data.get("lessons", [])
+            ]
         except Exception as e:
             logger.error(f"Failed to load lessons: {e}")
             _lessons_cache = []
@@ -304,7 +312,7 @@ def _save_lessons():
     lessons_file = _get_lessons_file()
     try:
         data = {
-            "lessons": [_lesson_to_dict(l) for l in _lessons_cache],
+            "lessons": [_lesson_to_dict(lesson) for lesson in _lessons_cache],
             "updated_at": datetime.now().isoformat(),
         }
         with open(lessons_file, "w") as f:
@@ -343,7 +351,7 @@ def _update_lesson_patterns():
         lesson_text = group[0].reflection.general_lesson if group[0].reflection else ""
 
         # Find existing lesson or create new
-        existing = next((l for l in lessons if l.pattern == key), None)
+        existing = next((lesson for lesson in lessons if lesson.pattern == key), None)
 
         # Calculate success rate
         successes = sum(1 for ep in group if ep.led_to_success)
@@ -378,13 +386,68 @@ def _keyword_similarity(text1: str, text2: str) -> float:
     words2 = set(text2.lower().split())
 
     # Remove common words
-    stopwords = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-                 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-                 'should', 'may', 'might', 'must', 'shall', 'can', 'to', 'of', 'in',
-                 'for', 'on', 'with', 'at', 'by', 'from', 'as', 'into', 'through',
-                 'and', 'but', 'or', 'nor', 'so', 'yet', 'both', 'either', 'neither',
-                 'not', 'only', 'own', 'same', 'than', 'too', 'very', 'just', 'that',
-                 'this', 'these', 'those', 'it', 'its'}
+    stopwords = {
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "may",
+        "might",
+        "must",
+        "shall",
+        "can",
+        "to",
+        "of",
+        "in",
+        "for",
+        "on",
+        "with",
+        "at",
+        "by",
+        "from",
+        "as",
+        "into",
+        "through",
+        "and",
+        "but",
+        "or",
+        "nor",
+        "so",
+        "yet",
+        "both",
+        "either",
+        "neither",
+        "not",
+        "only",
+        "own",
+        "same",
+        "than",
+        "too",
+        "very",
+        "just",
+        "that",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+    }
 
     words1 = words1 - stopwords
     words2 = words2 - stopwords
@@ -589,7 +652,9 @@ def retrieve_episodes(
     scored = []
     for episode in candidates:
         task_sim = _keyword_similarity(task, episode.task)
-        error_sim = _keyword_similarity(error_pattern, episode.feedback) if error_pattern else 0
+        error_sim = (
+            _keyword_similarity(error_pattern, episode.feedback) if error_pattern else 0
+        )
 
         # Combine scores (task similarity more important)
         score = task_sim * 0.7 + error_sim * 0.3
@@ -603,22 +668,34 @@ def retrieve_episodes(
     # Take top-k
     results = []
     for score, episode in scored[:top_k]:
-        results.append({
-            "episode_id": episode.id,
-            "task": episode.task[:200],
-            "approach": episode.approach[:200],
-            "outcome": episode.outcome.value,
-            "feedback_type": episode.feedback_type.value,
-            "attempt_number": episode.attempt_number,
-            "similarity_score": round(score, 3),
-            "reflection": {
-                "what_went_wrong": episode.reflection.what_went_wrong if episode.reflection else "",
-                "root_cause": episode.reflection.root_cause if episode.reflection else "",
-                "what_to_try_next": episode.reflection.what_to_try_next if episode.reflection else "",
-                "general_lesson": episode.reflection.general_lesson if episode.reflection else "",
-            } if episode.reflection else None,
-            "created_at": episode.created_at,
-        })
+        results.append(
+            {
+                "episode_id": episode.id,
+                "task": episode.task[:200],
+                "approach": episode.approach[:200],
+                "outcome": episode.outcome.value,
+                "feedback_type": episode.feedback_type.value,
+                "attempt_number": episode.attempt_number,
+                "similarity_score": round(score, 3),
+                "reflection": {
+                    "what_went_wrong": episode.reflection.what_went_wrong
+                    if episode.reflection
+                    else "",
+                    "root_cause": episode.reflection.root_cause
+                    if episode.reflection
+                    else "",
+                    "what_to_try_next": episode.reflection.what_to_try_next
+                    if episode.reflection
+                    else "",
+                    "general_lesson": episode.reflection.general_lesson
+                    if episode.reflection
+                    else "",
+                }
+                if episode.reflection
+                else None,
+                "created_at": episode.created_at,
+            }
+        )
 
     return {
         "query_task": task[:100],
@@ -652,11 +729,13 @@ def generate_improved_attempt(
     if similar_episodes:
         for ep in similar_episodes:
             if ep.get("reflection") and ep["reflection"].get("general_lesson"):
-                past_lessons.append({
-                    "task": ep.get("task", "")[:80],
-                    "lesson": ep["reflection"]["general_lesson"],
-                    "what_worked": ep["reflection"].get("what_to_try_next", ""),
-                })
+                past_lessons.append(
+                    {
+                        "task": ep.get("task", "")[:80],
+                        "lesson": ep["reflection"]["general_lesson"],
+                        "what_worked": ep["reflection"].get("what_to_try_next", ""),
+                    }
+                )
 
     return {
         "original_output_summary": original_output[:300],
@@ -667,7 +746,9 @@ def generate_improved_attempt(
         "past_lessons": past_lessons[:5],  # Top 5 relevant lessons
         "improvement_strategy": {
             "1_address_root_cause": f"Fix: {reflection.get('root_cause', 'the identified issue')}",
-            "2_apply_lesson": reflection.get("what_to_try_next", "Apply the learned approach"),
+            "2_apply_lesson": reflection.get(
+                "what_to_try_next", "Apply the learned approach"
+            ),
             "3_avoid_patterns": "Don't repeat approaches that failed in similar past episodes",
             "4_verify_before_submit": "Ensure the fix addresses the original feedback",
         },
@@ -709,15 +790,19 @@ def get_reflection_history(
     # Format results
     history = []
     for episode in filtered[:limit]:
-        history.append({
-            "episode_id": episode.id,
-            "task": episode.task[:100],
-            "outcome": episode.outcome.value,
-            "feedback_type": episode.feedback_type.value,
-            "attempt_number": episode.attempt_number,
-            "lesson": episode.reflection.general_lesson if episode.reflection else None,
-            "created_at": episode.created_at,
-        })
+        history.append(
+            {
+                "episode_id": episode.id,
+                "task": episode.task[:100],
+                "outcome": episode.outcome.value,
+                "feedback_type": episode.feedback_type.value,
+                "attempt_number": episode.attempt_number,
+                "lesson": episode.reflection.general_lesson
+                if episode.reflection
+                else None,
+                "created_at": episode.created_at,
+            }
+        )
 
     # Calculate stats
     outcomes = [e.outcome for e in filtered]
@@ -762,15 +847,17 @@ def get_common_lessons() -> dict[str, Any]:
 
     # Also include aggregated lesson patterns with effectiveness
     _update_lesson_patterns()
-    lessons = _load_lessons()
+    lesson_patterns = _load_lessons()
     effective_lessons = [
         {
-            "lesson": l.lesson,
-            "feedback_type": l.feedback_type.value,
-            "occurrences": l.occurrences,
-            "success_rate": round(l.success_rate, 3),
+            "lesson": lesson.lesson,
+            "feedback_type": lesson.feedback_type.value,
+            "occurrences": lesson.occurrences,
+            "success_rate": round(lesson.success_rate, 3),
         }
-        for l in sorted(lessons, key=lambda x: x.success_rate * x.occurrences, reverse=True)[:10]
+        for lesson in sorted(
+            lesson_patterns, key=lambda x: x.success_rate * x.occurrences, reverse=True
+        )[:10]
     ]
 
     return {
@@ -851,7 +938,11 @@ def get_episode_stats() -> dict[str, Any]:
     """
     episodes = _load_episodes()
     if not episodes:
-        return {"message": "No episodes stored yet.", "total": 0, "storage": str(DATA_DIR)}
+        return {
+            "message": "No episodes stored yet.",
+            "total": 0,
+            "storage": str(DATA_DIR),
+        }
 
     # Count by outcome
     outcomes = {}
@@ -882,7 +973,9 @@ def get_episode_stats() -> dict[str, Any]:
     # Lesson effectiveness stats
     lessons_applied = sum(1 for e in episodes if e.lesson_applied_from)
     lessons_effective = sum(1 for e in episodes if e.led_to_success)
-    lesson_effectiveness = lessons_effective / lessons_applied if lessons_applied > 0 else 0
+    lesson_effectiveness = (
+        lessons_effective / lessons_applied if lessons_applied > 0 else 0
+    )
 
     return {
         "total_episodes": total,
@@ -890,7 +983,9 @@ def get_episode_stats() -> dict[str, Any]:
         "by_feedback_type": feedback_types,
         "success_rate": round(success_rate, 3),
         "average_attempts": round(avg_attempts, 2),
-        "most_common_failures": dict(sorted(failure_types.items(), key=lambda x: x[1], reverse=True)[:5]),
+        "most_common_failures": dict(
+            sorted(failure_types.items(), key=lambda x: x[1], reverse=True)[:5]
+        ),
         "lesson_effectiveness": {
             "lessons_applied": lessons_applied,
             "led_to_success": lessons_effective,
@@ -965,28 +1060,38 @@ def export_lessons(
     if feedback_type:
         try:
             fb_type = FeedbackType(feedback_type)
-            filtered = [l for l in filtered if l.feedback_type == fb_type]
+            filtered = [
+                lesson for lesson in filtered if lesson.feedback_type == fb_type
+            ]
         except ValueError:
             pass
 
-    filtered = [l for l in filtered if l.occurrences >= min_occurrences]
-    filtered = [l for l in filtered if l.success_rate >= min_success_rate]
+    filtered = [lesson for lesson in filtered if lesson.occurrences >= min_occurrences]
+    filtered = [
+        lesson for lesson in filtered if lesson.success_rate >= min_success_rate
+    ]
 
     # Sort by effectiveness
-    filtered.sort(key=lambda l: l.success_rate * l.occurrences, reverse=True)
+    filtered.sort(
+        key=lambda lesson: lesson.success_rate * lesson.occurrences, reverse=True
+    )
 
     # Format for learner skill
     exportable = []
     for lesson in filtered[:20]:  # Top 20
-        exportable.append({
-            "pattern": f"{lesson.feedback_type.value}: {lesson.lesson}",
-            "lesson": lesson.lesson,
-            "feedback_type": lesson.feedback_type.value,
-            "occurrences": lesson.occurrences,
-            "success_rate": round(lesson.success_rate, 3),
-            "examples": lesson.example_tasks[:3],
-            "confidence": min(1.0, lesson.occurrences * lesson.success_rate / 5),  # Confidence based on data
-        })
+        exportable.append(
+            {
+                "pattern": f"{lesson.feedback_type.value}: {lesson.lesson}",
+                "lesson": lesson.lesson,
+                "feedback_type": lesson.feedback_type.value,
+                "occurrences": lesson.occurrences,
+                "success_rate": round(lesson.success_rate, 3),
+                "examples": lesson.example_tasks[:3],
+                "confidence": min(
+                    1.0, lesson.occurrences * lesson.success_rate / 5
+                ),  # Confidence based on data
+            }
+        )
 
     return {
         "lessons": exportable,
@@ -1032,7 +1137,9 @@ def link_episode_to_lesson(
     return {
         "episode_id": episode_id,
         "linked_to": lesson_episode_id,
-        "lesson_applied": lesson_episode.reflection.general_lesson if lesson_episode.reflection else None,
+        "lesson_applied": lesson_episode.reflection.general_lesson
+        if lesson_episode.reflection
+        else None,
         "instruction": "After completing this task, call mark_lesson_effective to track if the lesson helped.",
     }
 
