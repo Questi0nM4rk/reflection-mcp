@@ -136,6 +136,8 @@ def _init_schema(conn: libsql.Connection) -> None:
             attempt_number INTEGER DEFAULT 1,
             duration_seconds REAL,
             tags TEXT,
+            model_used TEXT,
+            backlog_task_id TEXT,
             lesson_applied_from TEXT,
             led_to_success INTEGER,
             effectiveness_score REAL DEFAULT 0.0,
@@ -385,6 +387,8 @@ def store_episode(
     file_path: str | None = None,
     tags: list[str] | None = None,
     duration_seconds: float | None = None,
+    model_used: str | None = None,
+    backlog_task_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Store a learning episode in episodic memory.
@@ -400,6 +404,8 @@ def store_episode(
         file_path: Path to the file being modified
         tags: Optional tags for categorization
         duration_seconds: How long the attempt took
+        model_used: Model that attempted this task (haiku, sonnet, opus)
+        backlog_task_id: Link to backlog task ID (e.g., "JC-TASK-001")
 
     Returns:
         Stored episode ID and confirmation
@@ -431,8 +437,9 @@ def store_episode(
                 INSERT INTO episodes (
                     episode_id, task, approach, outcome, feedback, feedback_type,
                     reflection, code_context, file_path, attempt_number,
-                    duration_seconds, tags, embedding, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    duration_seconds, tags, model_used, backlog_task_id,
+                    embedding, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     episode_id,
@@ -447,6 +454,8 @@ def store_episode(
                     attempt_number,
                     duration_seconds,
                     _json_dumps(tags),
+                    model_used.lower() if model_used else None,
+                    backlog_task_id,
                     embedding,
                     now,
                 ),
@@ -462,6 +471,8 @@ def store_episode(
                 "task": task[:100],
                 "attempt_number": attempt_number,
                 "outcome": outcome_type.value,
+                "model_used": model_used.lower() if model_used else None,
+                "backlog_task_id": backlog_task_id,
                 "stored": True,
                 "total_episodes": total,
                 "lesson": reflection.get("general_lesson", ""),
@@ -508,8 +519,8 @@ def retrieve_episodes(
                 try:
                     sql = """
                         SELECT episode_id, task, approach, outcome, feedback_type,
-                               attempt_number, reflection, created_at,
-                               vector_distance_cos(embedding, ?) as distance
+                               attempt_number, reflection, model_used, backlog_task_id,
+                               created_at, vector_distance_cos(embedding, ?) as distance
                         FROM episodes
                         WHERE embedding IS NOT NULL
                     """
@@ -536,6 +547,8 @@ def retrieve_episodes(
                             ep_fb_type,
                             ep_attempt,
                             ep_refl_json,
+                            ep_model,
+                            ep_backlog_task,
                             ep_created,
                             distance,
                         ) = row
@@ -551,6 +564,8 @@ def retrieve_episodes(
                                 "outcome": ep_outcome,
                                 "feedback_type": ep_fb_type,
                                 "attempt_number": ep_attempt,
+                                "model_used": ep_model,
+                                "backlog_task_id": ep_backlog_task,
                                 "similarity_score": round(score, 3),
                                 "reflection": {
                                     "what_went_wrong": refl.get("what_went_wrong", "")
@@ -577,7 +592,7 @@ def retrieve_episodes(
 
             # Fallback: keyword similarity
             if not results:
-                sql = "SELECT episode_id, task, approach, outcome, feedback, feedback_type, attempt_number, reflection, created_at FROM episodes"
+                sql = "SELECT episode_id, task, approach, outcome, feedback, feedback_type, attempt_number, reflection, model_used, backlog_task_id, created_at FROM episodes"
                 params = []
 
                 conditions = []
@@ -606,6 +621,8 @@ def retrieve_episodes(
                         ep_fb_type,
                         ep_attempt,
                         ep_refl_json,
+                        ep_model,
+                        ep_backlog_task,
                         ep_created,
                     ) = row
 
@@ -629,6 +646,8 @@ def retrieve_episodes(
                                 "outcome": ep_outcome,
                                 "feedback_type": ep_fb_type,
                                 "attempt_number": ep_attempt,
+                                "model_used": ep_model,
+                                "backlog_task_id": ep_backlog_task,
                                 "similarity_score": round(score, 3),
                                 "reflection": {
                                     "what_went_wrong": refl.get("what_went_wrong", "")
