@@ -33,11 +33,14 @@ from contextlib import contextmanager
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Generator
+from typing import TYPE_CHECKING, Any, Generator
 from uuid import uuid4
 
 import libsql_experimental as libsql
 from mcp.server.fastmcp import FastMCP
+
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -61,14 +64,14 @@ mcp = FastMCP(
 
 # Lazy-loaded singleton (use sentinel to distinguish "not loaded" from "unavailable")
 _NOT_LOADED = object()
-_embedding_model: object = _NOT_LOADED
+_embedding_model: "SentenceTransformer | None | object" = _NOT_LOADED
 
 
-def _get_embedding_model():
+def _get_embedding_model() -> "SentenceTransformer | None":
     """Get or load the sentence transformer model."""
     global _embedding_model
     if _embedding_model is not _NOT_LOADED:
-        return _embedding_model
+        return _embedding_model  # type: ignore
 
     try:
         from sentence_transformers import SentenceTransformer
@@ -82,7 +85,7 @@ def _get_embedding_model():
         logger.warning(f"Failed to load embedding model: {e}")
         _embedding_model = None
 
-    return _embedding_model
+    return _embedding_model  # type: ignore
 
 
 class FeedbackType(str, Enum):
@@ -159,6 +162,7 @@ def _init_schema(conn: libsql.Connection) -> None:
             episode_id TEXT NOT NULL,
             lesson_episode_id TEXT NOT NULL,
             created_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(episode_id, lesson_episode_id),
             FOREIGN KEY (episode_id) REFERENCES episodes(episode_id) ON DELETE CASCADE,
             FOREIGN KEY (lesson_episode_id) REFERENCES episodes(episode_id) ON DELETE CASCADE
         );
@@ -199,12 +203,17 @@ def _embed(text: str) -> bytes | None:
         return None
 
 
-def _json_loads(val: str | None) -> dict | list | None:
-    """Parse JSON or return None."""
+def _json_loads(val: str | None) -> dict[str, Any] | None:
+    """Parse JSON or return None. Assumes reflection column is always a dict."""
     if val is None:
         return None
     try:
-        return json.loads(val)
+        result = json.loads(val)
+        # Type narrowing: reflection column is always a dict
+        if isinstance(result, dict):
+            return result
+        logger.warning(f"Expected dict in reflection column, got {type(result)}")
+        return None
     except (json.JSONDecodeError, TypeError):
         return None
 
@@ -758,6 +767,7 @@ def get_reflection_history(
         with _get_db() as conn:
             limit = min(max(limit, 1), 50)
 
+            escaped_task = ""
             if task:
                 escaped_task = _escape_like(task)
                 cursor = conn.execute(
@@ -927,6 +937,10 @@ def clear_episodes(
         Number of episodes cleared
     """
     try:
+        # Validate older_than_days is positive
+        if older_than_days is not None and older_than_days <= 0:
+            return {"error": f"older_than_days must be positive, got {older_than_days}"}
+
         with _get_db() as conn:
             # Get initial count
             cursor = conn.execute("SELECT COUNT(*) FROM episodes")
@@ -1226,11 +1240,12 @@ def link_episode_to_lesson(
                 (lesson_episode_id, episode_id),
             )
 
-            # Add link
+            # Add link (ignore if already exists due to unique constraint)
             conn.execute(
                 """
                 INSERT INTO episode_links (episode_id, lesson_episode_id)
                 VALUES (?, ?)
+                ON CONFLICT DO NOTHING
                 """,
                 (episode_id, lesson_episode_id),
             )

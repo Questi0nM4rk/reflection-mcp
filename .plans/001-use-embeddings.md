@@ -28,6 +28,8 @@ except ImportError:
 full = ["sentence-transformers>=2.0.0"]
 ```
 
+(Note: numpy is not explicitly listed as it's a transitive dependency of sentence-transformers)
+
 ## Done Criteria
 
 - [ ] Add optional sentence-transformers dependency
